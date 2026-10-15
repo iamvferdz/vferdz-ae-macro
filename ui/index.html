@@ -1301,21 +1301,6 @@
             <button id="toggle-debug-screenshots" class="toggle-switch" onclick="toggleSetting('debug_screenshots', this)"></button>
           </div>
 
-          <!-- Off by default: the strict OCR check ("unitteams", no space)
-               is correct for most setups and confirms the Load Team list
-               specifically. This loosens it to also accept "teams"/"team"/
-               "loadout" for setups where the strict text keeps missing --
-               those are generic enough to risk matching the PREVIOUS screen
-               (the Unit Manager, whose own Teams button reads "Teams") right
-               before a fixed-coordinate row click, so it's opt-in. -->
-          <div class="setting-row" style="padding: 14px;">
-            <div>
-              <div class="setting-label">Loose Team Panel Detection</div>
-              <div class="setting-desc">If Team Loadout keeps failing to open on your setup, this widens the OCR check that confirms it. Off by default -- the wider match can misfire on the previous screen.</div>
-            </div>
-            <button id="toggle-loose-team-ocr-match" class="toggle-switch" onclick="toggleSetting('loose_team_ocr_match', this)"></button>
-          </div>
-
           <!-- These three decide HOW the game gets captured, which is what
                this panel is for. They used to sit under "Expedition Wave
                Check", where someone hitting a black/blank capture would never
@@ -1469,19 +1454,31 @@
           <div class="setting-row" style="padding: 14px;">
             <div>
               <div class="setting-label">Macro Operation</div>
-              <div class="setting-desc">Which saved template's Pre Start/Battle blocks to run.</div>
+              <div class="setting-desc">Which saved template to use for Pre Start/Battle tests and the saved-equipment setting.</div>
             </div>
             <select id="debug-macro-op-select" class="task-select" style="width: 220px; flex-shrink: 0;"></select>
           </div>
 
-          <div class="setting-row" style="padding: 14px; border-bottom: none;">
+          <div class="setting-row" style="padding: 14px;">
             <div>
               <div class="setting-label">Test Pre Start / Battle</div>
               <div class="setting-desc">Runs once through Pre Start (place units, flip settings), or ticks Battle blocks continuously until you press Stop -- this counts as a real run, so F2/Stop and F5/Pause work on it.</div>
             </div>
+
             <div style="display: flex; gap: 8px; flex-shrink: 0;">
               <button id="btn-debug-test-prestart" onclick="testMacroOperation(this, 'prestart')" class="text-xs font-semibold px-3 py-1.5 rounded-lg border flex-shrink-0 settings-action-btn" style="color: var(--slate); border-color: var(--border);">Test Pre Start</button>
               <button id="btn-debug-test-battle" onclick="testMacroOperation(this, 'battle')" class="text-xs font-semibold px-3 py-1.5 rounded-lg border flex-shrink-0 settings-action-btn" style="color: var(--slate); border-color: var(--border);">Test Battle</button>
+            </div>
+          </div>
+
+          <div class="setting-row" style="padding: 14px;">
+            <div>
+              <div class="setting-label">Test Team Loadout</div>
+              <div class="setting-desc">Select and use a team immediately, without running Pre Start or entering a battle. Choose the team below; the saved-equipment setting comes from the selected Macro Operation.</div>
+            </div>
+            <div style="display: flex; gap: 8px; align-items: center; flex-shrink: 0;">
+              <select id="debug-team-loadout-select" class="task-select" style="width: 110px;"></select>
+              <button id="btn-debug-test-team-loadout" onclick="testMacroOperation(this, 'team_loadout')" class="text-xs font-semibold px-3 py-1.5 rounded-lg border flex-shrink-0 settings-action-btn" style="color: var(--slate); border-color: var(--border);">Test Team Loadout</button>
             </div>
           </div>
 
@@ -1962,14 +1959,38 @@
           <div class="setting-row" style="padding: 14px;">
             <div>
               <div class="setting-label">Team Loadout Rows</div>
-              <div class="setting-desc">Pick clicks Loadout 1 then Loadout 2 -- Row H is computed from the gap. Or type the numbers.</div>
+              <div class="setting-desc">The eight Team buttons in the Unit Teams panel's left column. Pick Team 1 then Team 2 to calculate the row spacing.</div>
             </div>
             <div class="flex items-center gap-2 flex-shrink-0">
               <input id="coord-team_loadout_x" class="block-input" style="width: 56px;" type="number" onchange="setMacroCoord('team_loadout_x', this.value)">
               <input id="coord-team_loadout_y" class="block-input" style="width: 56px;" type="number" onchange="setMacroCoord('team_loadout_y', this.value)">
               <span class="text-xs" style="color: var(--text-muted); margin-left: 6px;">Row H</span>
               <input id="coord-team_loadout_row_height" class="block-input" style="width: 52px;" type="number" onchange="setMacroCoord('team_loadout_row_height', this.value)">
-              <button onclick="openCoordPicker('team_loadout')" class="text-xs font-semibold px-2 py-1.5 rounded-lg border flex-shrink-0 settings-action-btn" style="color: var(--slate); border-color: var(--border);" title="Capture the Roblox screen, click Loadout 1 then Loadout 2 -- Row H is auto-computed">Pick</button>
+              <button onclick="openCoordPicker('team_loadout')" class="text-xs font-semibold px-2 py-1.5 rounded-lg border flex-shrink-0 settings-action-btn" style="color: var(--slate); border-color: var(--border);" title="Capture the Unit Teams screen, click Team 1 then Team 2 -- Row H is auto-computed">Pick</button>
+            </div>
+          </div>
+
+          <div class="setting-row" style="padding: 14px;">
+            <div>
+              <div class="setting-label">Saved Equipment Checkbox</div>
+              <div class="setting-desc">Click point and state-detection center for the Equip Saved Equipment checkbox.</div>
+            </div>
+            <div class="flex items-center gap-2 flex-shrink-0">
+              <input id="coord-team_equipment_x" class="block-input" style="width: 56px;" type="number" onchange="setMacroCoord('team_equipment_x', this.value)">
+              <input id="coord-team_equipment_y" class="block-input" style="width: 56px;" type="number" onchange="setMacroCoord('team_equipment_y', this.value)">
+              <button onclick="openCoordPicker('team_equipment')" class="text-xs font-semibold px-2 py-1.5 rounded-lg border flex-shrink-0 settings-action-btn" style="color: var(--slate); border-color: var(--border);" title="Capture the Unit Teams screen and pick the Equip Saved Equipment checkbox">Pick</button>
+            </div>
+          </div>
+
+          <div class="setting-row" style="padding: 14px;">
+            <div>
+              <div class="setting-label">Use Team Button</div>
+              <div class="setting-desc">Click point for applying the selected Team. The Unit Teams panel is closed separately.</div>
+            </div>
+            <div class="flex items-center gap-2 flex-shrink-0">
+              <input id="coord-team_use_x" class="block-input" style="width: 56px;" type="number" onchange="setMacroCoord('team_use_x', this.value)">
+              <input id="coord-team_use_y" class="block-input" style="width: 56px;" type="number" onchange="setMacroCoord('team_use_y', this.value)">
+              <button onclick="openCoordPicker('team_use')" class="text-xs font-semibold px-2 py-1.5 rounded-lg border flex-shrink-0 settings-action-btn" style="color: var(--slate); border-color: var(--border);" title="Capture the Unit Teams screen and pick Use Team">Pick</button>
             </div>
           </div>
 

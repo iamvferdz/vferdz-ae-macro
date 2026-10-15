@@ -406,22 +406,25 @@ result_modal_close.png
 team.png
   Used by Team Loadout application (core.runner._apply_team_loadout).
   After pressing H, the runner waits for this to confirm the team-select
-  panel actually opened, then clicks it before picking a Loadout row.
+  panel actually opened, then clicks it to open the Unit Teams screen.
 
 team_loadout_open.png
-  The "Unit Teams" title shown only after the Teams button successfully
-  opens the Load Team list. The runner waits for this and retries Teams
-  before it is allowed to scroll or click a loadout row.
+  The "Unit Teams" title shown after the Teams button opens the updated
+  interface. The runner waits for this before selecting one of the eight
+  fixed rows in the left column and uses its disappearance to confirm that
+  the close button has closed the panel. Team selection itself is verified
+  from the selected row's gold/orange highlight before the runner proceeds.
 
-confirm.png
-  Used by Team Loadout application, right after clicking a Loadout row --
-  confirms the choice before moving on to the equipment pick. Variants in
-  this folder cover both the older and current Confirm button rendering.
+  Team selection is followed by setting the Equip Saved Equipment checkbox
+  and clicking Use Team once. The runner then clicks the red X close button
+  separately using the existing nav_closeui Image Manager image, retrying
+  that close click only while the Unit Teams title is still visible. The old
+  confirm/include/exclude popup templates are no longer used by Team Loadout.
 
-include.png / exclude.png
-  Used by Team Loadout application to pick Include or Exclude for
-  equipment (whichever the task's template has set) after Confirm. Variants
-  cover both the older buttons and the current Include Equipment dialog.
+team_use.png (optional)
+  Crop the updated "Use Team" button and add it under Image Manager > UI
+  Buttons. When present, Team Loadout uses its detected button position.
+  Without it, the saved Use Team coordinates are used.
 
 reconnect/
   Optional. Roblox's own "Reconnect"/"Retry" prompt, shown when it actually

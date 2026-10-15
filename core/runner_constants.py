@@ -773,55 +773,24 @@ TARGET_PRIORITY_STEP_DELAY = 0.18
 AUTO_UPGRADE_PANEL_LOAD_TIMEOUT = 3.0
 AUTO_UPGRADE_PANEL_POLL_INTERVAL = 0.15
 
-# Team Loadout application (see _apply_team_loadout) -- H opens the panel,
-# then Loadout 1-3 are stacked rows at a fixed position. 4+ exist in
-# Creation's picker but aren't reachable yet without scrolling.
+# Team Loadout application (see _apply_team_loadout) -- H opens Units, then
+# Teams opens the Unit Teams screen with eight fixed rows down its left side.
 TEAM_PANEL_TIMEOUT = 5.0
-# The first "Teams" click only opens the Load Team list; it does not select
-# anything. Do not scroll/click a row until the list's own title is visible.
-# A missed Teams click is retried as a Teams click, rather than incorrectly
-# repeating row clicks against the still-closed Unit Manager screen.
+# Do not select a row until the Unit Teams title is visible; retry Teams
+# rather than clicking against the Unit Manager screen if the transition fails.
 TEAM_LOADOUT_OPEN_RETRY_ATTEMPTS = 3
 TEAM_LOADOUT_OPEN_THRESHOLD = 0.85
-TEAM_LOADOUT_OPEN_SETTLE = 0.5
-# Clicking the Loadout row is what actually equips the team for the match --
-# if Confirm never shows up afterward (a dropped click, same flakiness class
-# as START_GAME_CLICK_RETRY_ATTEMPTS/SOLO_START_RETRY_ATTEMPTS), the run
-# must NOT just carry on into Start Game with no team applied (a guaranteed
-# loss, confirmed from a real report) -- retried instead, up to this many
-# attempts, before actually giving up and failing Pre Start over it.
-TEAM_LOADOUT_CONFIRM_RETRY_ATTEMPTS = 3
-# The equipment choice can render after the Confirm click; recheck it before
-# giving up and forcing the whole task back through lobby setup.
-TEAM_LOADOUT_EQUIPMENT_RETRY_ATTEMPTS = 3
-# Clicking a Loadout row makes the Confirm button SLIDE UP into place, and
-# it's still animating for a beat afterward -- searching for "confirm"
-# immediately finds it mid-slide, so the click lands where the button WAS a
-# fraction of a second ago instead of where it comes to rest, missing it
-# entirely (verified from a real test: a 2s wait here fixed it). Settle here
-# first so the button has stopped moving before it's located, so the found
-# position is the final one.
-TEAM_LOADOUT_CONFIRM_SETTLE = 2.0
-TEAM_LOADOUT_CLICK_1 = (800, 324)  # Loadout 1's row
-TEAM_LOADOUT_ROW_HEIGHT = 126
+TEAM_LOADOUT_OPEN_SETTLE = 0.75
+TEAM_LOADOUT_SELECT_RETRY_ATTEMPTS = 3
+TEAM_LOADOUT_SELECT_VERIFY_TIMEOUT = 1.0
+TEAM_LOADOUT_CLOSE_RETRY_ATTEMPTS = 3
+TEAM_LOADOUT_CLOSE_VERIFY_TIMEOUT = 2.0
+TEAM_LOADOUT_CLICK_1 = (270, 241)  # Team 1's row in the left column
+TEAM_LOADOUT_ROW_HEIGHT = 38
 TEAM_LOADOUT_MAX_SUPPORTED = 8
-# The configured X is the old button-edge coordinate. The current green
-# Load Team button spans roughly x=792..911; move 50px inward so the click
-# lands at its center instead of on a bevel that intermittently ignores it.
-TEAM_LOADOUT_BUTTON_CENTER_X_OFFSET = 50
-# Loadouts 4-8: hover the actual scrollbar (not a row button) and wheel down.
-# Live 1152x756 measurements: each notch shifts the list by 100px and current
-# rows are 137px apart. Seven notches reaches the bottom; the last slot's
-# button is clipped by the panel but remains clickable at y=579.
-TEAM_LOADOUT_SCROLLBAR_HOVER = (927, 400)
-TEAM_LOADOUT_WHEEL_DELTA = -120
-TEAM_LOADOUT_WHEEL_MAX_STEPS = 7
-TEAM_LOADOUT_WHEEL_ROW_SHIFT = 100
-TEAM_LOADOUT_CURRENT_ROW_HEIGHT = 137
-TEAM_LOADOUT_VISIBLE_BOTTOM_Y = 579
-TEAM_LOADOUT_SCROLL_HOVER_SETTLE = 0.08
-TEAM_LOADOUT_WHEEL_INTERVAL = 0.15
-TEAM_LOADOUT_SCROLL_SETTLE = 0.5
+TEAM_LOADOUT_EQUIPMENT_CLICK = (600, 584)
+TEAM_LOADOUT_USE_CLICK = (884, 584)
+TEAM_LOADOUT_ACTION_SETTLE = 0.6
 
 # Wait for Wave (see _run_wait_wave_tick) -- the "<current> / <max> wave"
 # HUD badge, in the docked game window's own client coordinates.
@@ -937,6 +906,8 @@ DEFAULT_COORDS = {
     "expedition_difficulty_x": EXPEDITION_DIFFICULTY_CLICK[0], "expedition_difficulty_y": EXPEDITION_DIFFICULTY_CLICK[1],
     "team_loadout_x": TEAM_LOADOUT_CLICK_1[0], "team_loadout_y": TEAM_LOADOUT_CLICK_1[1],
     "team_loadout_row_height": TEAM_LOADOUT_ROW_HEIGHT,
+    "team_equipment_x": TEAM_LOADOUT_EQUIPMENT_CLICK[0], "team_equipment_y": TEAM_LOADOUT_EQUIPMENT_CLICK[1],
+    "team_use_x": TEAM_LOADOUT_USE_CLICK[0], "team_use_y": TEAM_LOADOUT_USE_CLICK[1],
     # Optional manual point inside the Unit Manager's Teams button. None
     # keeps the normal image-match center click; Settings > Debug can fill
     # this from a live screenshot when a user's button needs a lower/safer

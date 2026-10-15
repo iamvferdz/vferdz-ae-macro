@@ -1,17 +1,17 @@
 """The macro's actual run loop -- Dashboard > Start. Currently covers the
 launch sequence (confirm the task queue isn't empty, confirm we're on the
 lobby screen, open Play > Story), picking the first task's map and stage,
-Pre Start (camera setup, Team Loadout, a per-map default walk, the task's
-Macro Operation template's Pre Start blocks), pressing Start Game, and then
+Pre Start (camera setup, Team Loadout including saved-equipment selection,
+a per-map default walk, the task's Macro Operation template's Pre Start
+blocks), pressing Start Game, and then
 watching the battle for Battle-phase blocks (Upgrade/Sell/Auto Upgrade Unit)
 and a Victory/Defeat screen -- which is recorded to run history/win-loss
 counts and, if a webhook is configured, reported to Discord as a screenshot
 of the result screen plus a rendered win/loss card (see
 _handle_match_result/_send_result_webhook -- the stats/reward OCR this used
 to do per match now lives only behind Settings > Debug's on-demand "Read
-Rewards"/"Read Game Stats" buttons). Equipment include/exclude, and the
-rest of the Battle-phase block types (Walk/Wait/Setting), plug in once those
-exist.
+Rewards"/"Read Game Stats" buttons). The remaining Battle-phase block types
+(Walk/Wait/Setting) plug in as they are implemented.
 """
 import os
 import threading
@@ -78,42 +78,34 @@ def _parse_extract_after(value, default=1):
     return int(parsed)
 
 
-def _find_team_load_button(frame, expected_y):
-    """Return the visible green Load Team button nearest ``expected_y``.
-
-    The list can be rendered in a larger, undocked Roblox window, and slot
-    8 is only partly visible at the bottom after scrolling. Work in the
-    normalized 1152x756 capture and accept that clipped button, then let
-    vision.ref_to_screen scale its center back to the real window.
-    """
+def _team_equipment_checkbox_checked(frame, x: int, y: int):
+    """Read the green checkmark from the saved-equipment checkbox."""
     if frame is None or frame.size == 0:
         return None
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    green = cv2.inRange(hsv, (35, 100, 100), (95, 255, 255))
-
-    # Load Team buttons live only in the right side of this panel. Keeping
-    # the mask inside that band prevents green unit art/world scenery from
-    # becoming a click target.
-    restricted = green.copy()
-    restricted[:160, :] = 0
-    restricted[700:, :] = 0
-    restricted[:, :680] = 0
-    restricted[:, 980:] = 0
-
-    candidates = []
-    count, _, stats, centroids = cv2.connectedComponentsWithStats(restricted)
-    for index in range(1, count):
-        x, y, width, height, area = stats[index]
-        # Full buttons are about 108x47 in reference space. Slot 8 can be
-        # clipped to roughly half-height but remains a wide solid rectangle.
-        if width < 70 or height < 14 or area < 1000:
-            continue
-        cx, cy = centroids[index]
-        candidates.append((abs(cy - expected_y), int(round(cx)), int(round(cy))))
-    if not candidates:
+    x1, x2 = max(0, x - 10), min(frame.shape[1], x + 11)
+    y1, y2 = max(0, y - 10), min(frame.shape[0], y + 11)
+    checkbox = frame[y1:y2, x1:x2]
+    if checkbox.size == 0:
         return None
-    _, cx, cy = min(candidates)
-    return cx, cy
+    if int(checkbox.max()) < 20:
+        return None
+    hsv = cv2.cvtColor(checkbox, cv2.COLOR_BGR2HSV)
+    green = cv2.inRange(hsv, (35, 100, 100), (95, 255, 255))
+    return cv2.countNonZero(green) >= 8
+
+
+def _team_loadout_row_selected(frame, x: int, y: int):
+    """Detect the gold/orange selected-state fill within one team row."""
+    if frame is None or frame.size == 0:
+        return None
+    x1, x2 = max(0, x - 55), min(frame.shape[1], x + 55)
+    y1, y2 = max(0, y - 14), min(frame.shape[0], y + 15)
+    row = frame[y1:y2, x1:x2]
+    if row.size == 0:
+        return None
+    hsv = cv2.cvtColor(row, cv2.COLOR_BGR2HSV)
+    selected = cv2.inRange(hsv, (8, 100, 100), (38, 255, 255))
+    return cv2.countNonZero(selected) >= 50
 
 
 class MacroRunner(BountyOps, ChallengeOps, CraftingOps, FuelOps, ShopOps, ExpeditionOps, BlockOps):
@@ -244,8 +236,6 @@ class MacroRunner(BountyOps, ChallengeOps, CraftingOps, FuelOps, ShopOps, Expedi
         self._paused_logged = False
         self._stop_logged = False  # one "Stopped." per stop -- see _checkpoint
         self._debug_screenshots = False
-        # Off by default -- see _apply_team_loadout_panel's OCR confirmation.
-        self._loose_team_ocr_match = False
         self._current_hwnd = None       # set at the top of _run
         self._hwnd_getter = None        # set at the top of _run -- lets _attempt_rejoin find a re-docked hwnd
         # A deep-link launch is handed to Roblox/Bloxstrap, so there is no
@@ -339,7 +329,7 @@ class MacroRunner(BountyOps, ChallengeOps, CraftingOps, FuelOps, ShopOps, Expedi
     def start(self, hwnd_getter, get_tasks, scroll_power: int = None, coords: dict = None,
               scroll_nudges: int = None, debug_screenshots: bool = False, default_walk_paths: dict = None,
               webhook: dict = None, expedition_color_buttons: bool = True,
-              expedition_camera_o_ms: float = 100, loose_team_ocr_match: bool = False,
+              expedition_camera_o_ms: float = 100,
               memory_refresh_enabled: bool = False,
               memory_refresh_hours: float = MEMORY_REFRESH_DEFAULT_HOURS) -> dict:
         if self.is_running():
@@ -349,7 +339,6 @@ class MacroRunner(BountyOps, ChallengeOps, CraftingOps, FuelOps, ShopOps, Expedi
         self._paused_logged = False
         self._stop_logged = False
         self._debug_screenshots = bool(debug_screenshots)
-        self._loose_team_ocr_match = bool(loose_team_ocr_match)
         self._expedition_color_buttons = bool(expedition_color_buttons)
         try:
             self._expedition_camera_o_ms = max(0.0, float(expedition_camera_o_ms))
@@ -379,25 +368,29 @@ class MacroRunner(BountyOps, ChallengeOps, CraftingOps, FuelOps, ShopOps, Expedi
         return {"ok": True}
 
     def start_debug_test(self, hwnd_getter, mode: str, macro_name: str, debug_screenshots: bool = False,
-                           coords: dict = None) -> dict:
-        """Settings > Debug > "Test Pre Start"/"Test Battle" -- runs a
-        chosen Macro Operation's Pre Start or Battle blocks against Roblox
-        as it is right now, WITHOUT going through the whole lobby/gamemode/
-        map/stage/teleport setup a real task needs first. Goes through the
+                           coords: dict = None, team_num=None) -> dict:
+        """Run a selected Macro Operation test against the current Roblox
+        screen, without lobby, map, stage, or battle setup. Goes through the
         exact same self._thread/self._stop_event start() itself uses (just
         targeting _run_debug_test instead of _run) specifically so this
         shows up as "running" the same way a real run does and F2/Stop
         actually interrupts it, instead of being a one-shot blocking call
         nothing can cancel (see debug_check_expedition_wave/
         debug_force_rejoin, which are that simpler kind on purpose -- this
-        one's meant to run for a while, e.g. Battle blocks ticking
-        indefinitely, so it needs the real thing)."""
+        one needs the real thing)."""
         if self.is_running():
             return {"ok": False, "reason": "already_running"}
-        if mode not in ("prestart", "battle"):
+        if mode not in ("prestart", "battle", "team_loadout"):
             return {"ok": False, "reason": "bad_mode"}
-        if not macro_name:
+        if mode != "team_loadout" and not macro_name:
             return {"ok": False, "reason": "no_macro"}
+        if mode == "team_loadout":
+            try:
+                team_num = int(team_num)
+            except (TypeError, ValueError):
+                return {"ok": False, "reason": "bad_team"}
+            if not 1 <= team_num <= TEAM_LOADOUT_MAX_SUPPORTED:
+                return {"ok": False, "reason": "bad_team"}
         self._stop_event = threading.Event()
         self._pause_event.clear()
         self._paused_logged = False
@@ -415,12 +408,13 @@ class MacroRunner(BountyOps, ChallengeOps, CraftingOps, FuelOps, ShopOps, Expedi
         self._memory_refresh_next_at = None
         self._thread = threading.Thread(
             target=self._run_debug_test,
-            args=(hwnd_getter, mode, macro_name, self._stop_event),
+            args=(hwnd_getter, mode, macro_name, team_num, self._stop_event),
             daemon=True)
         self._thread.start()
         return {"ok": True}
 
-    def _run_debug_test(self, hwnd_getter, mode: str, macro_name: str, stop_event: threading.Event) -> None:
+    def _run_debug_test(self, hwnd_getter, mode: str, macro_name: str, team_num,
+                        stop_event: threading.Event) -> None:
         hwnd = hwnd_getter() if hwnd_getter else None
         if not hwnd or not wm.is_window(hwnd):
             self._log("[Debug] No Roblox window found -- can't test.")
@@ -435,14 +429,19 @@ class MacroRunner(BountyOps, ChallengeOps, CraftingOps, FuelOps, ShopOps, Expedi
         if not wm.activate_window(hwnd):
             self._log("[Debug] Couldn't confirm Roblox actually took focus -- clicks may not register "
                        "until it does. Continuing anyway.")
-        # Enough of a task shape for _run_prestart_blocks/_load_battle_blocks
+        # Enough of a task shape for the selected test operation
         # to work with -- both only ever read task["macro"] and (for
         # _strip_auto_upgrade_for_expedition) task["mode"]/task["map"], not
         # anything about a real match in progress.
         task = {"macro": macro_name, "mode": "story", "map": "-", "difficulty": "-"}
         try:
             wm.prevent_sleep()  # same keep-awake as a real run (see _run_session)
-            if mode == "prestart":
+            if mode == "team_loadout":
+                self._log(f'[Debug] Testing Team Loadout {team_num}...')
+                if not self._apply_team_loadout(hwnd, stop_event, task, team_override=team_num):
+                    if not stop_event.is_set():
+                        self._log("[Debug] Team Loadout test failed.")
+            elif mode == "prestart":
                 self._log(f'[Debug] Testing Pre Start blocks from "{macro_name}"...')
                 self._run_prestart_blocks(hwnd, stop_event, task, first_repeat=True)
             else:
@@ -1863,7 +1862,7 @@ class MacroRunner(BountyOps, ChallengeOps, CraftingOps, FuelOps, ShopOps, Expedi
         if self._checkpoint(stop_event):
             return None
 
-        # Team Loadout (including its Include/Exclude equipment choice) is
+        # Team Loadout (including its saved-equipment checkbox setting) is
         # applied earlier in Pre Start -- see _apply_team_loadout.
         self._set_status(action="Battle...")
         self._log("[Macro] Moving into Battle.")
@@ -3353,39 +3352,38 @@ class MacroRunner(BountyOps, ChallengeOps, CraftingOps, FuelOps, ShopOps, Expedi
         equipment = blocks.get("equipment") if blocks.get("equipment") in ("include", "exclude") else "include"
         return team_num, equipment
 
-    def _apply_team_loadout(self, hwnd, stop_event: threading.Event, task: dict) -> bool:
-        """Presses H to open the team-select panel, waits for it to
-        actually open, clicks the task's Macro Operation template's
-        configured Team Loadout slot (1-8, scrolling for 4-8), clicks
-        Confirm, picks Include/Exclude for equipment, then presses H again
-        to close the panel.
+    def _apply_team_loadout(self, hwnd, stop_event: threading.Event, task: dict,
+                            team_override=None) -> bool:
+        """Open Unit Teams, select one of its eight rows, set saved equipment,
+        and use the selected team.
 
         No team configured, an unrecognized/out-of-range slot number (a
         template config problem retrying can't fix either) still just skip
         with a log line and report success -- there was never a team to
-        apply. But once a team num IS valid, actually equipping it is not
-        optional: skipping a genuine failure (panel never opened, Confirm
-        never showed up) used to just log and move on, which silently
-        started the round with no team equipped -- a guaranteed loss
-        (confirmed from a real report). Those cases now report failure so
-        the caller (_run_prestart) fails this match setup instead of
-        starting it, sending the run back through the normal recover-to-
-        lobby-and-retry path rather than straight into a loss.
+        apply. Once a team number is valid, selection failures report false
+        so a real run retries instead of starting with the wrong team.
         """
         macro_name = task.get("macro")
-        if not macro_name:
+        if not macro_name and team_override is None:
             return True
         from . import templates as tpl
-        data = tpl.load_template(macro_name)
+        data = tpl.load_template(macro_name) if macro_name else {}
         blocks = data.get("blocks") or {}
         if isinstance(blocks, list):
-            return True  # old-format template -- same as _run_prestart_blocks
-        # Read team setting from template blocks or task fallback (handling int/str types)
-        raw_team = blocks.get("team") if blocks.get("team") is not None and blocks.get("team") != "" else task.get("team")
+            if team_override is None:
+                return True  # old-format template -- same as _run_prestart_blocks
+            blocks = {}
+        raw_team = (
+            team_override if team_override is not None
+            else blocks.get("team") if blocks.get("team") not in (None, "")
+            else task.get("team")
+        )
         team = str(raw_team).strip() if raw_team is not None else ""
         if not team:
             return True
-        equipment = blocks.get("equipment") if blocks.get("equipment") in ("include", "exclude") else "include"
+        equipment = blocks.get("equipment")
+        if equipment not in ("include", "exclude"):
+            equipment = task.get("equipment") if task.get("equipment") in ("include", "exclude") else "include"
 
         try:
             team_num = int(team)
@@ -3393,8 +3391,8 @@ class MacroRunner(BountyOps, ChallengeOps, CraftingOps, FuelOps, ShopOps, Expedi
             self._log(f'[Macro] Team Loadout "{team}" isn\'t a recognized slot number -- skipping.')
             return True
         if not (1 <= team_num <= TEAM_LOADOUT_MAX_SUPPORTED):
-            self._log(f'[Macro] Team Loadout {team_num} needs scrolling to reach (only 1-'
-                       f'{TEAM_LOADOUT_MAX_SUPPORTED} are positioned so far) -- skipping.')
+            self._log(f'[Macro] Team Loadout {team_num} is outside the supported range 1-'
+                       f'{TEAM_LOADOUT_MAX_SUPPORTED} -- skipping.')
             return True
 
         team_loadout = (team_num, equipment)
@@ -3415,31 +3413,71 @@ class MacroRunner(BountyOps, ChallengeOps, CraftingOps, FuelOps, ShopOps, Expedi
                 self._log(f'[Macro] "team" not found within {TEAM_PANEL_TIMEOUT:.0f}s after pressing H -- '
                            f'the team panel never opened. Team Loadout {team_num} was NOT applied.')
             return False
+        applied = False
+        team_panel_applied = False
         try:
-            applied = self._apply_team_loadout_panel(hwnd, stop_event, team_match, team_num, equipment)
+            team_panel_applied = self._apply_team_loadout_panel(
+                hwnd, stop_event, team_match, team_num, equipment)
+            if not team_panel_applied:
+                return False
+            if not self._close_unit_manager_panel(hwnd, stop_event):
+                return False
+            applied = True
             if applied:
                 self._last_applied_team_loadout = team_loadout
             return applied
         finally:
-            # Every early-return inside the panel flow (scroll landing wrong,
-            # Confirm/equipment images never showing up, a checkpoint stop)
-            # used to skip this and leave the H panel sitting open -- which
-            # then blocked the NEXT Pre Start's camera setup: right-click
-            # doesn't lock/hide the cursor while a UI panel like this has
-            # focus, so the camera drag's relative nudges moved the real,
-            # unlocked cursor instead of rotating the camera, reported as
-            # "holding right click on a UI, mouse just moves instead of
-            # locking". Closing here unconditionally, however this call
-            # exits, means a broken loadout never leaves that trap for the
-            # match that follows it.
+            # On failure, H closes the panel so the next attempt doesn't
+            # inherit its focus.
+            if not team_panel_applied:
+                self._keyboard.tap(ord("H"))
+                self._log("[Macro] Closed the Team Loadout panel after a failed selection.")
+                self._interruptible_sleep(1.0, stop_event)
+
+    def _close_unit_manager_panel(self, hwnd, stop_event: threading.Event) -> bool:
+        self._interruptible_sleep(TEAM_LOADOUT_ACTION_SETTLE, stop_event)
+        for attempt in range(1, TEAM_LOADOUT_CLOSE_RETRY_ATTEMPTS + 1):
+            if self._checkpoint(stop_event):
+                return False
+            try:
+                panel_match = vision.find_image(hwnd, "team")
+            except vision.TemplateNotFound as exc:
+                self._log(f"[Macro] Can't verify whether the Units panel is open: {exc}")
+                self._save_debug_screenshot_unconditional(hwnd, "team_loadout_units_close_failed")
+                return False
+            if panel_match is None:
+                self._log("[Macro] Units panel is closed.")
+                return True
+
             self._keyboard.tap(ord("H"))
-            self._log("[Macro] Closed the Team Loadout panel.")
-            self._interruptible_sleep(1.5, stop_event)
+            self._log(f"[Macro] Pressed H to close the Units panel (attempt "
+                      f"{attempt}/{TEAM_LOADOUT_CLOSE_RETRY_ATTEMPTS}); waiting for it to close.")
+            deadline = time.time() + TEAM_LOADOUT_CLOSE_VERIFY_TIMEOUT
+            while time.time() < deadline:
+                if self._checkpoint(stop_event):
+                    return False
+                try:
+                    panel_match = vision.find_image(hwnd, "team")
+                except vision.TemplateNotFound as exc:
+                    self._log(f"[Macro] Can't verify the Units panel closed: {exc}")
+                    self._save_debug_screenshot_unconditional(hwnd, "team_loadout_units_close_failed")
+                    return False
+                if panel_match is None:
+                    self._log("[Macro] Units panel closed.")
+                    return True
+                time.sleep(0.2)
+            if attempt < TEAM_LOADOUT_CLOSE_RETRY_ATTEMPTS:
+                self._log("[Macro] Units panel is still visible -- retrying H.")
+
+        self._log(f"[Macro] Units panel stayed open after "
+                  f"{TEAM_LOADOUT_CLOSE_RETRY_ATTEMPTS} close attempts.")
+        self._save_debug_screenshot_unconditional(hwnd, "team_loadout_units_close_failed")
+        return False
 
     def _apply_team_loadout_panel(self, hwnd, stop_event: threading.Event, team_match, team_num: int,
                                     equipment: str) -> bool:
         # The "team" image proves only that the Unit Manager is open. Clicking
-        # it starts a second transition into the actual Load Team list. The
+        # it opens the updated Unit Teams screen. The
         # old path waited a blind 0.3s and immediately scrolled/clicked; if
         # this click was early or dropped, every later action landed against
         # the wrong screen. Verify the destination's own title and retry THIS
@@ -3453,7 +3491,7 @@ class MacroRunner(BountyOps, ChallengeOps, CraftingOps, FuelOps, ShopOps, Expedi
             if self._checkpoint(stop_event):
                 return False
             if attempt > 1:
-                self._log(f'[Macro] Load Team list did not open -- retrying the Teams button '
+                self._log(f'[Macro] Unit Teams did not open -- retrying the Teams button '
                            f'(attempt {attempt}/{TEAM_LOADOUT_OPEN_RETRY_ATTEMPTS}).')
             if manual_team_click is None:
                 vision.click_match(self._mouse, hwnd, team_match)
@@ -3461,192 +3499,142 @@ class MacroRunner(BountyOps, ChallengeOps, CraftingOps, FuelOps, ShopOps, Expedi
                 vision.click_match(self._mouse, hwnd, {
                     "cx": manual_team_click[0], "cy": manual_team_click[1],
                 })
-            self._log("[Macro] Clicked Teams -- waiting for the Load Team list.")
+            self._log("[Macro] Clicked Teams -- waiting for Unit Teams.")
             try:
                 loadout_open = vision.wait_for_image(
                     hwnd, "team_loadout_open", threshold=TEAM_LOADOUT_OPEN_THRESHOLD,
                     timeout=TEAM_PANEL_TIMEOUT, stop_event=stop_event)
             except vision.TemplateNotFound as exc:
-                self._log(f"[Macro] Can't verify the Load Team list: {exc}")
+                self._log(f"[Macro] Can't verify the Unit Teams screen: {exc}")
                 return False
-            if loadout_open is None and not stop_event.is_set() and ocr_windows.is_available():
-                # The current game has rendered this title at two subtly
-                # different widths even after both captures were normalized
-                # to 1152x756. Keep the strict image threshold, but do not
-                # claim the list is closed when Windows OCR can read its
-                # exact title. This is confirmation only -- no OCR-derived
-                # coordinate is clicked.
-                frame = vision.capture_game_bgr(hwnd)
-                text = ocr_windows.ocr_image(frame) if frame is not None else ""
-                normalized = "".join((text or "").lower().split())
-                # Strict by default: "unitteams" (no space) is specific to
-                # this exact screen. Settings > Debug > "Loose Team Panel
-                # Detection" opts into also accepting "teams"/"team"/
-                # "loadout" for setups where the strict text keeps missing --
-                # off by default because those are generic enough to already
-                # appear on the PREVIOUS screen (the still-open Unit Manager,
-                # whose own Teams button reads "Teams"), which would confirm
-                # the panel open before the transition actually happens, right
-                # before a fixed-coordinate row click.
-                keywords = (("unitteams", "loadteam", "teamloadout", "teams", "team", "loadout")
-                            if self._loose_team_ocr_match else ("unitteams",))
-                if any(k in normalized for k in keywords):
-                    loadout_open = {"detector": "windows_ocr", "text": text or "Unit Teams"}
             if loadout_open is not None:
                 break
             if stop_event.is_set():
                 return False
         if loadout_open is None:
-            self._log(f'[Macro] Load Team list never opened after '
+            self._log(f'[Macro] Unit Teams screen never opened after '
                       f'{TEAM_LOADOUT_OPEN_RETRY_ATTEMPTS} Teams clicks.')
             self._save_debug_screenshot_unconditional(hwnd, "team_loadout_open_failed")
             return False
-        if loadout_open.get("detector") == "windows_ocr":
-            self._log(f'[Macro] Load Team list open (confirmed by Windows OCR: "{loadout_open.get("text")}").')
-        else:
-            self._log(f'[Macro] Load Team list open (score {loadout_open["score"]:.2f}).')
+        self._log(f'[Macro] Unit Teams screen open (score {loadout_open["score"]:.2f}).')
         # The title arrives before the row animation has completely settled.
         time.sleep(TEAM_LOADOUT_OPEN_SETTLE)
         if self._checkpoint(stop_event):
             return False
 
-        row1_x, row1_y = self._cxy("team_loadout")  # Loadout 1's row (Settings > Debug > Macro Coordinates)
-        row_x = row1_x + TEAM_LOADOUT_BUTTON_CENTER_X_OFFSET
-        if team_num > 3:
-            # Dragging from the old (895, 285) point was unreliable for two
-            # separate reasons confirmed against the live Windows UI: that
-            # point is on the Load Team button, not the scrollbar, and the
-            # 300px drag for slots 7/8 leaves the panel before mouse-up. Move
-            # over the real scrollbar and send ordinary wheel notches
-            # instead. Each notch shifts the rows by a stable 100px.
-            scroll_steps = min(team_num, TEAM_LOADOUT_WHEEL_MAX_STEPS)
-            hover_x, hover_y = vision.ref_to_screen(hwnd, *TEAM_LOADOUT_SCROLLBAR_HOVER)
-            self._mouse.move_to(hover_x, hover_y)
-            time.sleep(TEAM_LOADOUT_SCROLL_HOVER_SETTLE)
-            self._mouse.nudge()
-            for _ in range(scroll_steps):
-                self._mouse.scroll(TEAM_LOADOUT_WHEEL_DELTA)
-                time.sleep(TEAM_LOADOUT_WHEEL_INTERVAL)
-            time.sleep(TEAM_LOADOUT_SCROLL_SETTLE)
+        row_x, first_row_y = self._cxy("team_loadout")
+        row_y = first_row_y + (team_num - 1) * int(self._coords["team_loadout_row_height"])
+        row_screen_x, row_screen_y = vision.ref_to_screen(hwnd, row_x, row_y)
+        team_selected = False
+        for attempt in range(1, TEAM_LOADOUT_SELECT_RETRY_ATTEMPTS + 1):
             if self._checkpoint(stop_event):
                 return False
-            # Current rows are 137px apart. Account for the 100px movement
-            # from each wheel notch to click the requested row where it
-            # actually landed. Slot 8 bottoms out with only the top of its
-            # green button visible, so cap the click at the verified visible
-            # part of that button.
-            row_y = (
-                row1_y
-                + (team_num - 1) * TEAM_LOADOUT_CURRENT_ROW_HEIGHT
-                - scroll_steps * TEAM_LOADOUT_WHEEL_ROW_SHIFT
-            )
-            row_y = min(row_y, TEAM_LOADOUT_VISIBLE_BOTTOM_Y)
-            self._log(f"[Macro] Scrolled {scroll_steps} notch(es); Loadout {team_num} "
-                      f"is at ({row_x}, {row_y}).")
-        else:
-            row_y = row1_y + (team_num - 1) * int(self._coords["team_loadout_row_height"])
-
-        click_x, click_y = row_x, row_y
-        frame = vision.capture_game_bgr(hwnd)
-        detected_button = _find_team_load_button(frame, row_y)
-        if detected_button is not None:
-            click_x, click_y = detected_button
-            self._log(
-                f"[Macro] Detected Loadout {team_num} button at "
-                f"({click_x}, {click_y}); coordinate estimate was ({row_x}, {row_y})."
-            )
-        click_screen_x, click_screen_y = vision.ref_to_screen(hwnd, click_x, click_y)
-
-        # Clicking the Loadout row is what actually equips the team --
-        # Confirm not showing up afterward used to just skip the rest of
-        # this sequence, which silently entered the match with the
-        # PREVIOUS match's team (or none) still equipped, a guaranteed
-        # loss. Retried here instead (re-clicking the row each attempt, not
-        # just re-waiting -- a dropped click is the likely cause, same as
-        # every other retried click site in this codebase), and only after
-        # every attempt fails does this actually give up.
-        confirm_match = None
-        for attempt in range(1, TEAM_LOADOUT_CONFIRM_RETRY_ATTEMPTS + 1):
-            if self._checkpoint(stop_event):
-                return False
-            if attempt > 1:
-                self._log(f'[Macro] "confirm" didn\'t show up -- retrying Loadout {team_num} '
-                           f'(attempt {attempt}/{TEAM_LOADOUT_CONFIRM_RETRY_ATTEMPTS}).')
-            self._mouse.click(click_screen_x, click_screen_y)
-            self._log(f"[Macro] Clicked Loadout {team_num}.")
-            # Let the Confirm button finish sliding up before locating it --
-            # otherwise it's found mid-animation and the click lands where it
-            # was, not where it settles (see TEAM_LOADOUT_CONFIRM_SETTLE).
-            time.sleep(TEAM_LOADOUT_CONFIRM_SETTLE)
-            if self._checkpoint(stop_event):
-                return False
-            try:
-                confirm_match = vision.wait_for_image(
-                    hwnd, "confirm", timeout=TEAM_PANEL_TIMEOUT, stop_event=stop_event)
-            except vision.TemplateNotFound as exc:
-                self._log(f"[Macro] Can't confirm the Loadout Confirm button appeared: {exc}")
-                return False
-            if confirm_match is not None:
+            self._mouse.click(row_screen_x, row_screen_y)
+            self._log(f"[Macro] Clicked Team {team_num} (attempt "
+                      f"{attempt}/{TEAM_LOADOUT_SELECT_RETRY_ATTEMPTS}); waiting for selection.")
+            deadline = time.time() + TEAM_LOADOUT_SELECT_VERIFY_TIMEOUT
+            while time.time() < deadline:
+                if self._checkpoint(stop_event):
+                    return False
+                frame = vision.capture_game_bgr(hwnd)
+                selected = _team_loadout_row_selected(frame, row_x, row_y)
+                if selected is True:
+                    team_selected = True
+                    break
+                time.sleep(0.2)
+            if team_selected:
                 break
-            if stop_event.is_set():
-                return False
-        if confirm_match is None:
-            self._log(f'[Macro] "confirm" never showed up after {TEAM_LOADOUT_CONFIRM_RETRY_ATTEMPTS} attempts -- '
-                       f'Team Loadout {team_num} was NOT applied.')
-            self._save_debug_screenshot_unconditional(hwnd, "team_loadout_confirm_failed")
+            if attempt < TEAM_LOADOUT_SELECT_RETRY_ATTEMPTS:
+                self._log(f"[Macro] Team {team_num} is not visibly selected -- retrying its row.")
+        if not team_selected:
+            self._log(f"[Macro] Team {team_num} selection was not detected after "
+                      f"{TEAM_LOADOUT_SELECT_RETRY_ATTEMPTS} clicks.")
+            self._save_debug_screenshot_unconditional(hwnd, "team_loadout_select_failed")
             return False
-        vision.click_match(self._mouse, hwnd, confirm_match)
-        self._log("[Macro] Clicked Confirm.")
+
+        equipment_x, equipment_y = self._cxy("team_equipment")
+        frame = vision.capture_game_bgr(hwnd)
+        equipment_checked = _team_equipment_checkbox_checked(frame, equipment_x, equipment_y)
+        if equipment_checked is None:
+            self._log("[Macro] Couldn't read the saved-equipment checkbox; Team Loadout was NOT applied.")
+            self._save_debug_screenshot_unconditional(hwnd, "team_loadout_equipment_state_failed")
+            return False
+        should_check = equipment == "include"
+        if equipment_checked != should_check:
+            equipment_screen_x, equipment_screen_y = vision.ref_to_screen(
+                hwnd, equipment_x, equipment_y)
+            self._mouse.click(equipment_screen_x, equipment_screen_y)
+            time.sleep(TEAM_LOADOUT_ACTION_SETTLE)
+            frame = vision.capture_game_bgr(hwnd)
+            equipment_checked = _team_equipment_checkbox_checked(frame, equipment_x, equipment_y)
+            if equipment_checked != should_check:
+                self._log(f'[Macro] Could not set saved equipment to "{equipment}".')
+                self._save_debug_screenshot_unconditional(hwnd, "team_loadout_equipment_state_failed")
+                return False
+        self._log(f"[Macro] Saved equipment: {equipment}.")
         if self._checkpoint(stop_event):
             return False
 
-        # Confirm opens a second, required modal for the configured equipment
-        # choice.  Do not silently continue when it cannot be read: that
-        # starts the match with a different loadout than the template asked
-        # for.  Keep a screenshot of the unread screen so future game-art
-        # changes can be diagnosed from the actual failed frame.
-        equipment_option_found = False
-        for attempt in range(1, TEAM_LOADOUT_EQUIPMENT_RETRY_ATTEMPTS + 1):
+        time.sleep(TEAM_LOADOUT_ACTION_SETTLE)
+        use_x, use_y = self._cxy("team_use")
+        use_screen_x, use_screen_y = vision.ref_to_screen(hwnd, use_x, use_y)
+        try:
+            use_match = vision.find_image(hwnd, "team_use")
+        except vision.TemplateNotFound:
+            use_match = None
+            self._log('[Macro] Image Manager has no "team_use" image; using the saved Use Team coordinates.')
+        if self._checkpoint(stop_event):
+            return False
+        if use_match is None:
+            self._mouse.click(use_screen_x, use_screen_y)
+        else:
+            vision.click_match(self._mouse, hwnd, use_match)
+        self._log("[Macro] Clicked Use Team; waiting before closing Unit Teams.")
+        self._interruptible_sleep(TEAM_LOADOUT_ACTION_SETTLE, stop_event)
+
+        panel_closed = False
+        for attempt in range(1, TEAM_LOADOUT_CLOSE_RETRY_ATTEMPTS + 1):
             if self._checkpoint(stop_event):
                 return False
-            if attempt > 1:
-                self._log(f'[Macro] "{equipment}" equipment option did not appear -- '
-                           f'retrying detection (attempt {attempt}/{TEAM_LOADOUT_EQUIPMENT_RETRY_ATTEMPTS}).')
             try:
-                equip_match = vision.wait_for_image(
-                    hwnd, equipment, timeout=TEAM_PANEL_TIMEOUT, stop_event=stop_event)
+                close_match = vision.find_image(hwnd, "nav_closeui")
             except vision.TemplateNotFound as exc:
-                self._log(f"[Macro] Can't detect the {equipment} equipment option: {exc}")
-                break
-            if equip_match is not None:
-                equipment_option_found = True
-                break
-            if stop_event.is_set():
+                self._log(f"[Macro] Can't find the nav_closeui Image Manager template: {exc}")
+                self._save_debug_screenshot_unconditional(hwnd, "team_loadout_close_failed")
                 return False
+            if close_match is None:
+                self._log("[Macro] Couldn't detect the Unit Teams close button with nav_closeui.")
+                self._save_debug_screenshot_unconditional(hwnd, "team_loadout_close_failed")
+                return False
+            vision.click_match(self._mouse, hwnd, close_match)
+            self._log(f"[Macro] Clicked Unit Teams close button (attempt "
+                      f"{attempt}/{TEAM_LOADOUT_CLOSE_RETRY_ATTEMPTS}); waiting for the panel to close.")
 
-        if equipment_option_found:
-            if not self._click_and_verify_gone(
-                    hwnd, stop_event, equipment, TEAM_PANEL_TIMEOUT,
-                    require_gone=True):
-                self._log(f'[Macro] Could not click the "{equipment}" equipment option.')
-                self._save_debug_screenshot_unconditional(
-                    hwnd, f"team_loadout_{equipment}_failed")
-                return False
-            self._log(f'[Macro] Equipment: {equipment} (click confirmed).')
-            # Without a settle here, the caller's finally-block H tap (see
-            # _apply_team_loadout) fires on the very next line -- pressing H
-            # to close the panel before this click has actually registered
-            # in-game, so the equipment choice lands inconsistently or not
-            # at all and can leave the panel stuck in a half-closed state.
-            self._interruptible_sleep(0.5, stop_event)
-        else:
-            if stop_event.is_set():
-                return False
-            self._log(f'[Macro] "{equipment}" option never showed up -- Team Loadout '
-                      f'{team_num} was not fully applied.')
-            self._save_debug_screenshot_unconditional(hwnd, f"team_loadout_{equipment}_failed")
+            deadline = time.time() + TEAM_LOADOUT_CLOSE_VERIFY_TIMEOUT
+            while time.time() < deadline:
+                if self._checkpoint(stop_event):
+                    return False
+                try:
+                    panel_match = vision.find_image(hwnd, "team_loadout_open")
+                except vision.TemplateNotFound as exc:
+                    self._log(f"[Macro] Can't verify Unit Teams closed: {exc}")
+                    self._save_debug_screenshot_unconditional(hwnd, "team_loadout_close_failed")
+                    return False
+                if panel_match is None:
+                    panel_closed = True
+                    break
+                time.sleep(0.2)
+            if panel_closed:
+                break
+            if attempt < TEAM_LOADOUT_CLOSE_RETRY_ATTEMPTS:
+                self._log("[Macro] Unit Teams is still visible -- retrying its close button.")
+        if not panel_closed:
+            self._log(f"[Macro] Unit Teams stayed open after "
+                      f"{TEAM_LOADOUT_CLOSE_RETRY_ATTEMPTS} close-button clicks; "
+                      f"Team {team_num} was NOT confirmed.")
+            self._save_debug_screenshot_unconditional(hwnd, "team_loadout_close_failed")
             return False
-        return equip_match is not None
+        return True
 
 
 

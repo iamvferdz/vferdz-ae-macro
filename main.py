@@ -188,7 +188,9 @@ MACRO_COORD_DEFAULTS = {
     "challenge_stage_2_x": 460, "challenge_stage_2_y": 400,
     "challenge_stage_3_x": 460, "challenge_stage_3_y": 533,
     "expedition_difficulty_x": 441, "expedition_difficulty_y": 524,
-    "team_loadout_x": 800, "team_loadout_y": 324, "team_loadout_row_height": 126,
+    "team_loadout_x": 270, "team_loadout_y": 241, "team_loadout_row_height": 38,
+    "team_equipment_x": 600, "team_equipment_y": 584,
+    "team_use_x": 884, "team_use_y": 584,
     # Optional override for the first Teams click. None means use the live
     # image match center; the Macro Coordinates picker can save a safer point
     # inside the button for layouts where its lower/inner area registers more
@@ -210,6 +212,28 @@ MACRO_COORD_DEFAULTS = {
 # above, for the same reason -- a UI change in the game shifts these too.
 REWARD_REGION_DEFAULTS = {"x": 212, "y": 429, "width": 504, "height": 106}
 STATS_REGION_DEFAULTS = {"x": 210, "y": 337, "width": 509, "height": 57}
+
+
+def _macro_coords_from_settings(data: dict) -> dict:
+    data = data or {}
+    coords = {k: data.get(k, v) for k, v in MACRO_COORD_DEFAULTS.items()}
+    # Settings survive upgrades; replace only the former list defaults so
+    # hand-picked points are retained while existing users get the new rows.
+    for key, old_default in (
+        ("team_loadout_x", 800),
+        ("team_loadout_y", 324),
+        ("team_loadout_row_height", 126),
+    ):
+        if data.get(key, old_default) == old_default:
+            coords[key] = MACRO_COORD_DEFAULTS[key]
+    coords["portal_card_x"] = data.get(
+        "portal_card_x", data.get("summer_portal_card_x", coords["portal_card_x"])
+    )
+    coords["portal_card_y"] = data.get(
+        "portal_card_y", data.get("summer_portal_card_y", coords["portal_card_y"])
+    )
+    return coords
+
 
 RUN_HISTORY_LIMIT = 50  # oldest entries drop off past this -- a running log, not a permanent archive
 
@@ -862,14 +886,6 @@ class Api:
             # thread during FPS-sensitive capture or input.
             "memory_refresh_enabled": data.get("memory_refresh_enabled", False),
             "memory_refresh_hours": data.get("memory_refresh_hours", 4.0),
-            # Off by default -- see core.runner._apply_team_loadout_panel.
-            # The strict "unitteams" OCR confirmation is correct for most
-            # setups; this loosens it to also accept "teams"/"team"/"loadout"
-            # for whoever's setup renders the Load Team list title in a way
-            # the strict check keeps missing. Opt-in because a looser match
-            # risks confirming the panel open on the WRONG screen right
-            # before a fixed-coordinate row click.
-            "loose_team_ocr_match": data.get("loose_team_ocr_match", False),
         }
 
     def get_tasks(self) -> list:
@@ -907,12 +923,7 @@ class Api:
 
     def get_macro_coords(self) -> dict:
         data = cfg.load()
-        coords = {k: data.get(k, v) for k, v in MACRO_COORD_DEFAULTS.items()}
-        # Preserve coordinates saved by older builds under the Summer-specific
-        # key after the setting was generalized to all portal families.
-        coords["portal_card_x"] = data.get("portal_card_x", data.get("summer_portal_card_x", coords["portal_card_x"]))
-        coords["portal_card_y"] = data.get("portal_card_y", data.get("summer_portal_card_y", coords["portal_card_y"]))
-        return coords
+        return _macro_coords_from_settings(data)
 
     def set_macro_coord(self, key: str, value: int) -> dict:
         if key not in MACRO_COORD_DEFAULTS:
@@ -1635,7 +1646,7 @@ class Api:
         # against the current game window, ignoring the win threshold and the
         # enabled toggle (see runner_crafting.start_crafting_test / force).
         data = cfg.load()
-        coords = {k: data.get(k, v) for k, v in MACRO_COORD_DEFAULTS.items()}
+        coords = _macro_coords_from_settings(data)
         return self.runner.start_crafting_test(lambda: self.game_hwnd, coords)
 
     # -- Auto Shop (see core/auto_shop.py and core/runner_shop.py) --
@@ -2121,15 +2132,7 @@ class Api:
         data = cfg.load()
         scroll_power = data.get("story_scroll_power", 3)
         scroll_nudges = data.get("story_scroll_nudges", 8)
-        coords = {k: data.get(k, v) for k, v in MACRO_COORD_DEFAULTS.items()}
-        # Keep the portal reward click compatible with settings saved by older
-        # builds, which used the Summer-specific coordinate keys.
-        coords["portal_card_x"] = data.get(
-            "portal_card_x", data.get("summer_portal_card_x", coords["portal_card_x"])
-        )
-        coords["portal_card_y"] = data.get(
-            "portal_card_y", data.get("summer_portal_card_y", coords["portal_card_y"])
-        )
+        coords = _macro_coords_from_settings(data)
         debug_screenshots = data.get("debug_screenshots", False)
         default_walk_paths = self.get_default_walk_paths()
         webhook_settings = self.get_webhook_settings()
@@ -2138,7 +2141,6 @@ class Api:
             default_walk_paths, webhook_settings,
             expedition_color_buttons=data.get("expedition_color_buttons", True),
             expedition_camera_o_ms=data.get("expedition_camera_o_ms", 100),
-            loose_team_ocr_match=data.get("loose_team_ocr_match", False),
             memory_refresh_enabled=data.get("memory_refresh_enabled", False),
             memory_refresh_hours=data.get("memory_refresh_hours", 4.0))
 
@@ -3298,23 +3300,17 @@ class Api:
         ok = self.runner.debug_force_rejoin(hwnd, lambda: self.game_hwnd)
         return {"ok": ok}
 
-    def debug_test_macro_operation(self, mode: str, macro_name: str) -> dict:
-        # Settings > Debug > "Test Pre Start"/"Test Battle": runs a chosen
-        # Macro Operation's Pre Start or Battle blocks against Roblox as it
-        # is right now, no lobby/gamemode/map/stage/teleport setup needed
-        # first -- navigate to wherever the blocks should actually run
-        # (the unit-placement screen for Pre Start, an actual battle for
-        # Battle blocks) by hand, press this, watch it go. Runs as a real
-        # tracked run (self.runner.is_running() reports True the same as a
-        # normal Start), so the existing Stop/Pause buttons and F2/F5
-        # hotkeys work on it unchanged -- see MacroRunner.start_debug_test.
+    def debug_test_macro_operation(self, mode: str, macro_name: str, team_num=None) -> dict:
+        # Settings > Debug > Macro Operation Test: run Pre Start/Battle
+        # blocks or just select a Team Loadout against the current Roblox
+        # screen. Every mode runs as a tracked run and supports Stop/Pause.
         hwnd = self.game_hwnd
         if not hwnd or not wm.is_window(hwnd):
             return {"ok": False, "reason": "no_roblox"}
         data = cfg.load()
-        coords = {k: data.get(k, v) for k, v in MACRO_COORD_DEFAULTS.items()}
+        coords = _macro_coords_from_settings(data)
         return self.runner.start_debug_test(lambda: self.game_hwnd, mode, macro_name,
-                                              data.get("debug_screenshots", False), coords)
+                                              data.get("debug_screenshots", False), coords, team_num)
 
     def open_assets_folder(self) -> dict:
         # Settings > General > "Open Assets Folder" (also the Image

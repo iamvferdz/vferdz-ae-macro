@@ -1,11 +1,15 @@
 import threading
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 
 from core import runner as runner_module
-from core.runner import MacroRunner, _find_team_load_button
+from core.runner import (
+    MacroRunner,
+    _team_equipment_checkbox_checked,
+    _team_loadout_row_selected,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -20,12 +24,54 @@ def _blank_game_capture(monkeypatch):
 
 def _runner():
     runner = MacroRunner(MagicMock(), MagicMock(), MagicMock())
-    runner._coords = {
-        "team_loadout_x": 800,
-        "team_loadout_y": 324,
-        "team_loadout_row_height": 126,
-    }
+    runner._coords.update({
+        "team_loadout_x": 270,
+        "team_loadout_y": 241,
+        "team_loadout_row_height": 38,
+        "team_equipment_x": 600,
+        "team_equipment_y": 584,
+        "team_use_x": 884,
+        "team_use_y": 584,
+    })
     return runner
+
+
+def _checkbox_frame(checked):
+    frame = np.zeros((756, 1152, 3), dtype=np.uint8)
+    if checked:
+        frame[579:590, 594:607] = (0, 255, 0)
+    else:
+        frame[579:590, 594:607] = (32, 32, 32)
+    return frame
+
+
+def _team_row_frame(selected, x=270, y=241):
+    frame = np.zeros((756, 1152, 3), dtype=np.uint8)
+    color = (0, 150, 255) if selected else (60, 60, 60)
+    frame[y - 14:y + 15, x - 55:x + 55] = color
+    return frame
+
+
+def _selected_team_frame():
+    frame = _team_row_frame(True)
+    frame[579:590, 594:607] = (0, 255, 0)
+    return frame
+
+
+def _close_click_count(clicked_matches):
+    return sum(
+        isinstance(match, dict) and match.get("name") == "nav_closeui"
+        for match in clicked_matches
+    )
+
+
+def _fast_clock(monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr(runner_module.time, "time", lambda: now[0])
+    monkeypatch.setattr(
+        runner_module.time, "sleep",
+        lambda duration: now.__setitem__(0, now[0] + duration),
+    )
 
 
 def test_team_loadout_key_normalizes_slot_and_equipment(monkeypatch):
@@ -38,9 +84,22 @@ def test_team_loadout_key_normalizes_slot_and_equipment(monkeypatch):
     assert runner._team_loadout_key({"macro": "Farm"}) == (2, "exclude")
 
 
-def test_successful_team_loadout_is_recorded_for_next_task(monkeypatch):
+def test_checkbox_state_reader_detects_checked_and_unchecked():
+    assert _team_equipment_checkbox_checked(_checkbox_frame(True), 600, 584) is True
+    assert _team_equipment_checkbox_checked(_checkbox_frame(False), 600, 584) is False
+    assert _team_equipment_checkbox_checked(None, 600, 584) is None
+
+
+def test_team_row_selected_state_is_detected_from_highlight_color():
+    assert _team_loadout_row_selected(_team_row_frame(True), 270, 241) is True
+    assert _team_loadout_row_selected(_team_row_frame(False), 270, 241) is False
+    assert _team_loadout_row_selected(None, 270, 241) is None
+
+
+def test_successful_team_loadout_is_recorded_without_reopening_units(monkeypatch):
     runner = _runner()
     stop = threading.Event()
+    team_match = {"cx": 100, "cy": 100, "score": 0.95}
     monkeypatch.setattr(
         "core.templates.load_template",
         lambda _name: {"blocks": {"team": "2", "equipment": "include"}},
@@ -48,16 +107,45 @@ def test_successful_team_loadout_is_recorded_for_next_task(monkeypatch):
     monkeypatch.setattr(
         runner_module.vision,
         "wait_for_image",
-        lambda _hwnd, name, **_kwargs: {"team": {"score": 0.95}}[name],
+        lambda *_args, **_kwargs: {"cx": 100, "cy": 100, "score": 0.95},
     )
     monkeypatch.setattr(runner, "_apply_team_loadout_panel", lambda *_args: True)
     monkeypatch.setattr(runner, "_interruptible_sleep", lambda *_args: None)
+    monkeypatch.setattr(
+        runner_module.vision, "find_image",
+        lambda _hwnd, name: (
+            team_match if name == "team" and runner._keyboard.tap.call_count == 1 else None
+        ),
+    )
 
     assert runner._apply_team_loadout(123, stop, {"macro": "Farm"}) is True
     assert runner._last_applied_team_loadout == (2, "include")
+    assert runner._keyboard.tap.call_args_list == [
+        ((ord("H"),), {}), ((ord("H"),), {}),
+    ]
 
 
-def test_failed_team_loadout_clears_previous_success(monkeypatch):
+def test_retries_closing_units_panel_until_image_disappears(monkeypatch):
+    runner = _runner()
+    stop = threading.Event()
+    team_match = {"score": 0.95}
+    _fast_clock(monkeypatch)
+
+    monkeypatch.setattr(
+        runner_module.vision, "find_image",
+        lambda _hwnd, name: (
+            team_match if name == "team" and runner._keyboard.tap.call_count < 2 else None
+        ),
+    )
+
+    assert runner._close_unit_manager_panel(123, stop) is True
+    assert runner._keyboard.tap.call_args_list == [
+        ((ord("H"),), {}), ((ord("H"),), {}),
+    ]
+    assert any("retrying H" in entry.args[0] for entry in runner._log.call_args_list)
+
+
+def test_failed_team_loadout_closes_units_and_clears_previous_success(monkeypatch):
     runner = _runner()
     runner._last_applied_team_loadout = (1, "include")
     stop = threading.Event()
@@ -68,16 +156,17 @@ def test_failed_team_loadout_clears_previous_success(monkeypatch):
     monkeypatch.setattr(
         runner_module.vision,
         "wait_for_image",
-        lambda _hwnd, name, **_kwargs: {"team": {"score": 0.95}}[name],
+        lambda *_args, **_kwargs: {"cx": 100, "cy": 100, "score": 0.95},
     )
     monkeypatch.setattr(runner, "_apply_team_loadout_panel", lambda *_args: False)
     monkeypatch.setattr(runner, "_interruptible_sleep", lambda *_args: None)
 
     assert runner._apply_team_loadout(123, stop, {"macro": "Farm"}) is False
     assert runner._last_applied_team_loadout is None
+    assert runner._keyboard.tap.call_args_list == [((ord("H"),), {}), ((ord("H"),), {})]
 
 
-def test_matching_team_skips_loadout_on_next_task(monkeypatch):
+def test_matching_team_configuration_is_reused_for_next_task(monkeypatch):
     runner = _runner()
     runner._last_applied_team_loadout = (2, "include")
     monkeypatch.setattr(runner, "_team_loadout_key", lambda _task: (2, "include"))
@@ -88,461 +177,300 @@ def test_matching_team_skips_loadout_on_next_task(monkeypatch):
 
     assert runner._run_prestart(123, threading.Event(), {"macro": "Farm"}, {}) is True
     runner._apply_team_loadout.assert_not_called()
-    assert any("Reusing Team Loadout 2" in call.args[0] for call in runner._log.call_args_list)
+    assert any("Reusing Team Loadout 2" in entry.args[0] for entry in runner._log.call_args_list)
 
 
-def test_task_sequence_reuses_and_switches_team_or_equipment(monkeypatch):
+def test_retries_teams_until_unit_teams_screen_opens(monkeypatch):
     runner = _runner()
-    keys = {
-        "first": (1, "include"),
-        "same-team": (1, "include"),
-        "different-team": (2, "include"),
-        "different-equipment": (2, "exclude"),
-        "same-again": (2, "exclude"),
-    }
-    applied = []
-
-    monkeypatch.setattr(runner, "_team_loadout_key", lambda task: keys[task["name"]])
-    monkeypatch.setattr(runner, "_checkpoint", lambda _stop: False)
-    monkeypatch.setattr(runner, "_run_prestart_blocks", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(runner_module.camera, "run_camera_setup", lambda *_args, **_kwargs: None)
-
-    def apply_loadout(_hwnd, _stop, task):
-        key = keys[task["name"]]
-        applied.append(key)
-        runner._last_applied_team_loadout = key
-        return True
-
-    monkeypatch.setattr(runner, "_apply_team_loadout", apply_loadout)
-    stop = threading.Event()
-    for name in keys:
-        assert runner._run_prestart(123, stop, {"name": name}, {}) is True
-
-    assert applied == [(1, "include"), (2, "include"), (2, "exclude")]
-
-
-@pytest.mark.parametrize("task", [
-    {"mode": "story", "macro": "Farm"},
-    {"mode": "raid", "macro": "Farm"},
-    {"mode": "expedition", "macro": "Farm"},
-    {"mode": "boss_rush", "macro": "Farm"},
-    {"mode": "tower", "macro": "Farm"},
-    {"mode": "tournament", "macro": "Farm"},
-    {"mode": "summer", "macro": "Farm"},
-    {"mode": "story", "is_challenge": True, "macro": "Farm"},
-    {"mode": "story", "is_bounty": True, "macro": "Farm"},
-])
-def test_prestart_applies_configured_team_loadout_across_modes(monkeypatch, task):
-    runner = _runner()
-    applied = []
-    monkeypatch.setattr(runner, "_team_loadout_key", lambda _task: (2, "include"))
-    monkeypatch.setattr(
-        runner, "_apply_team_loadout",
-        lambda _hwnd, _stop, current: applied.append(current) or True)
-    monkeypatch.setattr(runner, "_checkpoint", lambda _stop: False)
-    monkeypatch.setattr(runner, "_run_prestart_blocks", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(runner_module.camera, "run_camera_setup", lambda *_args, **_kwargs: None)
-
-    assert runner._run_prestart(
-        123, threading.Event(), task, {}, run_blocks=task["mode"] != "boss_rush")
-    assert applied == [task]
-
-
-def test_retries_teams_click_until_loadout_list_is_visually_open(monkeypatch):
-    runner = _runner()
-    stop = threading.Event()
-    team_match = {"cx": 100, "cy": 100, "score": 0.95}
-    open_match = {"cx": 275, "cy": 185, "score": 0.91}
-    confirm_match = {"cx": 483, "cy": 416, "score": 0.98}
-    include_match = {"cx": 456, "cy": 436, "score": 0.99}
-    clicked_matches = []
-    open_checks = iter([None, open_match])
-
-    def wait_for_image(_hwnd, name, **_kwargs):
-        if name == "team_loadout_open":
-            return next(open_checks)
-        if name == "confirm":
-            return confirm_match
-        if name == "include":
-            return include_match
-        raise AssertionError(f"unexpected image: {name}")
-
+    clicked_teams = []
+    saved_screenshots = []
     monkeypatch.setattr(runner_module.time, "sleep", lambda _seconds: None)
-    monkeypatch.setattr(runner_module.wm, "get_client_rect_screen", lambda _hwnd: (0, 0, 1152, 756))
-    monkeypatch.setattr(runner_module.vision, "wait_for_image", wait_for_image)
-    monkeypatch.setattr(runner_module.ocr_windows, "is_available", lambda: False)
     monkeypatch.setattr(
-        runner_module.vision, "click_match",
-        lambda _mouse, _hwnd, match: clicked_matches.append(match),
+        runner_module.vision, "capture_game_bgr",
+        lambda _hwnd: pytest.fail("team detection must not invoke OCR capture"),
     )
-
-    assert runner._apply_team_loadout_panel(123, stop, team_match, 1, "include") is True
-    assert clicked_matches == [team_match, team_match, confirm_match, include_match]
-    runner._mouse.click.assert_called_once_with(850, 324)
-    assert any(
-        "retrying the Teams button" in logged.args[0]
-        for logged in runner._log.call_args_list
-    )
-
-
-def test_manual_teams_click_point_replaces_detected_match_center(monkeypatch):
-    runner = _runner()
-    runner._coords.update({"team_button_x": 438, "team_button_y": 570})
-    stop = threading.Event()
-    team_match = {"cx": 100, "cy": 100, "score": 0.95}
-    open_match = {"cx": 275, "cy": 185, "score": 0.91}
-    confirm_match = {"cx": 483, "cy": 416, "score": 0.98}
-    include_match = {"cx": 456, "cy": 436, "score": 0.99}
-    clicked_matches = []
-
-    def wait_for_image(_hwnd, name, **_kwargs):
-        return {
-            "team_loadout_open": open_match,
-            "confirm": confirm_match,
-            "include": include_match,
-        }[name]
-
-    monkeypatch.setattr(runner_module.time, "sleep", lambda _seconds: None)
-    monkeypatch.setattr(runner_module.vision, "wait_for_image", wait_for_image)
     monkeypatch.setattr(
-        runner_module.vision, "click_match",
-        lambda _mouse, _hwnd, match: clicked_matches.append(match),
+        runner_module.vision,
+        "wait_for_image",
+        lambda _hwnd, name, **_kwargs: {"score": 0.95} if name == "team" else None,
     )
-
-    assert runner._apply_team_loadout_panel(123, stop, team_match, 1, "include") is True
-    assert clicked_matches[0] == {"cx": 438, "cy": 570}
-    assert clicked_matches[0] != team_match
-
-
-def test_confirm_failure_saves_the_screen_that_detection_could_not_read(monkeypatch):
-    runner = _runner()
-    stop = threading.Event()
-    team_match = {"cx": 100, "cy": 100, "score": 0.95}
-    open_match = {"cx": 275, "cy": 185, "score": 0.91}
-    saved = []
-
-    def wait_for_image(_hwnd, name, **_kwargs):
-        return open_match if name == "team_loadout_open" else None
-
-    monkeypatch.setattr(runner_module, "TEAM_LOADOUT_CONFIRM_RETRY_ATTEMPTS", 1)
-    monkeypatch.setattr(runner_module.time, "sleep", lambda _seconds: None)
-    monkeypatch.setattr(runner_module.wm, "get_client_rect_screen", lambda _hwnd: (0, 0, 1152, 756))
-    monkeypatch.setattr(runner_module.vision, "wait_for_image", wait_for_image)
-    monkeypatch.setattr(runner_module.vision, "click_match", lambda *_args: None)
     monkeypatch.setattr(
-        runner, "_save_debug_screenshot_unconditional",
-        lambda _hwnd, name: saved.append(name),
-    )
-
-    assert runner._apply_team_loadout_panel(123, stop, team_match, 1, "include") is False
-    assert saved == ["team_loadout_confirm_failed"]
-
-
-def test_never_scrolls_or_clicks_a_row_when_loadout_list_did_not_open(monkeypatch):
-    runner = _runner()
-    stop = threading.Event()
-    team_match = {"cx": 100, "cy": 100, "score": 0.95}
-    team_clicks = []
-    saved = []
-
-    monkeypatch.setattr(runner_module.time, "sleep", lambda _seconds: None)
-    monkeypatch.setattr(runner_module.vision, "wait_for_image", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(runner_module.ocr_windows, "is_available", lambda: False)
-    monkeypatch.setattr(
-        runner_module.vision, "click_match",
-        lambda _mouse, _hwnd, match: team_clicks.append(match),
+        runner_module.vision,
+        "click_match",
+        lambda *_args: clicked_teams.append("clicked"),
     )
     monkeypatch.setattr(
         runner, "_save_debug_screenshot_unconditional",
-        lambda _hwnd, name: saved.append(name),
+        lambda _hwnd, name: saved_screenshots.append(name),
     )
 
-    assert runner._apply_team_loadout_panel(123, stop, team_match, 6, "include") is False
-    assert team_clicks == [team_match] * runner_module.TEAM_LOADOUT_OPEN_RETRY_ATTEMPTS
-    runner._mouse.drag.assert_not_called()
-    runner._mouse.scroll.assert_not_called()
+    assert runner._apply_team_loadout_panel(
+        123, threading.Event(), {"cx": 100, "cy": 100, "score": 0.95}, 1, "include"
+    ) is False
+    assert clicked_teams == ["clicked"] * runner_module.TEAM_LOADOUT_OPEN_RETRY_ATTEMPTS
+    assert saved_screenshots == ["team_loadout_open_failed"]
     runner._mouse.click.assert_not_called()
-    assert saved == ["team_loadout_open_failed"]
 
 
-def test_windows_ocr_confirms_current_unit_teams_title_without_lowering_threshold(monkeypatch):
+def test_retries_only_teams_button_until_unit_teams_is_detected(monkeypatch):
     runner = _runner()
     stop = threading.Event()
     team_match = {"cx": 100, "cy": 100, "score": 0.95}
-    confirm_match = {"cx": 483, "cy": 416, "score": 0.98}
-    include_match = {"cx": 456, "cy": 436, "score": 0.99}
+    use_match = {"score": 0.97}
+    close_match = {"name": "nav_closeui"}
+    opening_checks = iter([None, {"score": 0.96}])
+    clicked_matches = []
 
-    def wait_for_image(_hwnd, name, **_kwargs):
-        return {
-            "team_loadout_open": None,
-            "confirm": confirm_match,
-            "include": include_match,
-        }[name]
-
-    monkeypatch.setattr(runner_module.time, "sleep", lambda _seconds: None)
-    monkeypatch.setattr(runner_module.wm, "get_client_rect_screen", lambda _hwnd: (0, 0, 1152, 756))
-    monkeypatch.setattr(runner_module.vision, "wait_for_image", wait_for_image)
-    monkeypatch.setattr(runner_module.vision, "click_match", lambda *_args: None)
-    monkeypatch.setattr(
-        runner_module.vision, "capture_game_bgr",
-        lambda _hwnd: np.zeros((756, 1152, 3), dtype=np.uint8),
-    )
-    monkeypatch.setattr(runner_module.ocr_windows, "is_available", lambda: True)
-    monkeypatch.setattr(runner_module.ocr_windows, "ocr_image", lambda _frame: "Unit Teams")
-
-    assert runner._apply_team_loadout_panel(123, stop, team_match, 1, "include") is True
-    assert any(
-        'confirmed by Windows OCR: "Unit Teams"' in logged.args[0]
-        for logged in runner._log.call_args_list
-    )
-
-
-def test_generic_ocr_text_does_not_confirm_by_default(monkeypatch):
-    """Loose Team Panel Detection (Settings > Debug) is off by default --
-    a generic word like "Teams" (which the still-open Unit Manager's own
-    button already reads) must NOT be enough to confirm the Load Team list
-    is open unless the user opted into the wider match."""
-    runner = _runner()
-    assert runner._loose_team_ocr_match is False
-    stop = threading.Event()
-    team_match = {"cx": 100, "cy": 100, "score": 0.95}
-    saved = []
-
-    monkeypatch.setattr(runner_module.time, "sleep", lambda _seconds: None)
-    monkeypatch.setattr(runner_module.vision, "wait_for_image", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(runner_module.vision, "click_match", lambda *_args: None)
-    monkeypatch.setattr(
-        runner_module.vision, "capture_game_bgr",
-        lambda _hwnd: np.zeros((756, 1152, 3), dtype=np.uint8),
-    )
-    monkeypatch.setattr(runner_module.ocr_windows, "is_available", lambda: True)
-    monkeypatch.setattr(runner_module.ocr_windows, "ocr_image", lambda _frame: "Teams")
-    monkeypatch.setattr(
-        runner, "_save_debug_screenshot_unconditional",
-        lambda _hwnd, name: saved.append(name),
-    )
-
-    assert runner._apply_team_loadout_panel(123, stop, team_match, 1, "include") is False
-    assert saved == ["team_loadout_open_failed"]
-
-
-def test_generic_ocr_text_confirms_when_loose_match_is_enabled(monkeypatch):
-    runner = _runner()
-    runner._loose_team_ocr_match = True
-    stop = threading.Event()
-    team_match = {"cx": 100, "cy": 100, "score": 0.95}
-    confirm_match = {"cx": 483, "cy": 416, "score": 0.98}
-    include_match = {"cx": 456, "cy": 436, "score": 0.99}
-
-    def wait_for_image(_hwnd, name, **_kwargs):
-        return {
-            "team_loadout_open": None,
-            "confirm": confirm_match,
-            "include": include_match,
-        }[name]
-
-    monkeypatch.setattr(runner_module.time, "sleep", lambda _seconds: None)
-    monkeypatch.setattr(runner_module.wm, "get_client_rect_screen", lambda _hwnd: (0, 0, 1152, 756))
-    monkeypatch.setattr(runner_module.vision, "wait_for_image", wait_for_image)
-    monkeypatch.setattr(runner_module.vision, "click_match", lambda *_args: None)
-    monkeypatch.setattr(
-        runner_module.vision, "capture_game_bgr",
-        lambda _hwnd: np.zeros((756, 1152, 3), dtype=np.uint8),
-    )
-    monkeypatch.setattr(runner_module.ocr_windows, "is_available", lambda: True)
-    monkeypatch.setattr(runner_module.ocr_windows, "ocr_image", lambda _frame: "Teams")
-
-    assert runner._apply_team_loadout_panel(123, stop, team_match, 1, "include") is True
-    assert any(
-        'confirmed by Windows OCR: "Teams"' in logged.args[0]
-        for logged in runner._log.call_args_list
-    )
-
-
-def test_equipment_failure_saves_screen_and_fails_instead_of_silently_continuing(monkeypatch):
-    runner = _runner()
-    stop = threading.Event()
-    team_match = {"cx": 100, "cy": 100, "score": 0.95}
-    open_match = {"cx": 275, "cy": 185, "score": 0.91}
-    confirm_match = {"cx": 483, "cy": 416, "score": 0.98}
-    saved = []
+    _fast_clock(monkeypatch)
+    monkeypatch.setattr(runner_module.vision, "ref_to_screen", lambda _hwnd, x, y: (x, y))
+    frames = iter([
+        _team_row_frame(True),
+        _checkbox_frame(True),
+    ])
+    monkeypatch.setattr(runner_module.vision, "capture_game_bgr", lambda _hwnd: next(frames))
 
     def wait_for_image(_hwnd, name, **_kwargs):
         if name == "team_loadout_open":
-            return open_match
-        if name == "confirm":
-            return confirm_match
-        if name == "exclude":
-            return None
-        raise AssertionError(f"unexpected image: {name}")
+            return next(opening_checks)
+        raise AssertionError(f"unexpected image wait: {name}")
 
-    monkeypatch.setattr(runner_module.time, "sleep", lambda _seconds: None)
-    monkeypatch.setattr(runner_module.wm, "get_client_rect_screen", lambda _hwnd: (0, 0, 1152, 756))
-    monkeypatch.setattr(runner_module.vision, "wait_for_image", wait_for_image)
-    monkeypatch.setattr(runner_module.vision, "click_match", lambda *_args: None)
-    monkeypatch.setattr(
-        runner, "_save_debug_screenshot_unconditional",
-        lambda _hwnd, name: saved.append(name),
-    )
-
-    assert runner._apply_team_loadout_panel(123, stop, team_match, 1, "exclude") is False
-    assert saved == ["team_loadout_exclude_failed"]
-
-
-def test_delayed_include_option_is_retried_then_clicked(monkeypatch):
-    runner = _runner()
-    stop = threading.Event()
-    team_match = {"cx": 100, "cy": 100, "score": 0.95}
-    open_match = {"cx": 275, "cy": 185, "score": 0.91}
-    confirm_match = {"cx": 483, "cy": 416, "score": 0.98}
-    include_match = {"cx": 456, "cy": 436, "score": 0.99}
-    include_checks = iter([None, include_match, include_match])
-    clicked = []
-    include_threshold_args = []
-
-    def wait_for_image(_hwnd, name, **kwargs):
+    def find_image(_hwnd, name):
+        if name == "team_use":
+            return use_match
+        if name == "nav_closeui":
+            return close_match
         if name == "team_loadout_open":
-            return open_match
-        if name == "confirm":
-            return confirm_match
-        if name == "include":
-            include_threshold_args.append(kwargs.get("threshold"))
-            return next(include_checks)
-        raise AssertionError(f"unexpected image: {name}")
+            return {"score": 0.95} if _close_click_count(clicked_matches) == 0 else None
+        return None
 
-    monkeypatch.setattr(runner_module.time, "sleep", lambda _seconds: None)
-    monkeypatch.setattr(runner_module.wm, "get_client_rect_screen", lambda _hwnd: (0, 0, 1152, 756))
-    monkeypatch.setattr(runner_module.wm, "activate_window", lambda _hwnd: True)
     monkeypatch.setattr(runner_module.vision, "wait_for_image", wait_for_image)
-    monkeypatch.setattr(runner_module.vision, "find_image", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runner_module.vision, "find_image", find_image)
     monkeypatch.setattr(
         runner_module.vision, "click_match",
-        lambda _mouse, _hwnd, match: clicked.append(match),
+        lambda _mouse, _hwnd, match: clicked_matches.append(match),
     )
 
     assert runner._apply_team_loadout_panel(123, stop, team_match, 1, "include") is True
-    assert clicked[-1] == include_match
-    assert include_threshold_args == [None, None, None]
-    assert any(
-        "retrying detection" in logged.args[0]
-        for logged in runner._log.call_args_list
-    )
+    assert clicked_matches.count(team_match) == 2
+    assert runner._mouse.click.call_args_list[0].args == (270, 241)
+    assert clicked_matches.count(use_match) == 1
+    assert _close_click_count(clicked_matches) == 1
 
 
-def test_include_click_is_retried_and_fails_if_dialog_stays_open(monkeypatch):
+def test_retries_team_row_until_selected_highlight_is_detected(monkeypatch):
     runner = _runner()
     stop = threading.Event()
     team_match = {"cx": 100, "cy": 100, "score": 0.95}
-    open_match = {"cx": 275, "cy": 185, "score": 0.91}
-    confirm_match = {"cx": 483, "cy": 416, "score": 0.98}
-    include_match = {"cx": 456, "cy": 436, "score": 0.99}
-    clicked = []
-    saved = []
+    opened_match = {"score": 0.96}
+    use_match = {"score": 0.97}
+    close_match = {"name": "nav_closeui"}
+    clicked_matches = []
+    frames = iter([
+        *[_team_row_frame(False) for _ in range(6)],
+        _team_row_frame(True),
+        _checkbox_frame(True),
+    ])
 
-    def wait_for_image(_hwnd, name, **kwargs):
-        return {
-            "team_loadout_open": open_match,
-            "confirm": confirm_match,
-            "include": include_match,
-        }[name]
-
-    monkeypatch.setattr(runner_module.time, "sleep", lambda _seconds: None)
-    monkeypatch.setattr(runner_module.wm, "get_client_rect_screen", lambda _hwnd: (0, 0, 1152, 756))
-    monkeypatch.setattr(runner_module.wm, "activate_window", lambda _hwnd: True)
-    monkeypatch.setattr(runner_module.vision, "wait_for_image", wait_for_image)
+    _fast_clock(monkeypatch)
+    monkeypatch.setattr(runner_module.vision, "ref_to_screen", lambda _hwnd, x, y: (x, y))
+    monkeypatch.setattr(runner_module.vision, "capture_game_bgr", lambda _hwnd: next(frames))
+    monkeypatch.setattr(
+        runner_module.vision, "wait_for_image",
+        lambda _hwnd, name, **_kwargs: opened_match if name == "team_loadout_open" else None,
+    )
     def find_image(_hwnd, name):
-        assert name == "include"
-        return include_match
+        if name == "team_use":
+            return use_match
+        if name == "nav_closeui":
+            return close_match
+        if name == "team_loadout_open":
+            return {"score": 0.95} if _close_click_count(clicked_matches) == 0 else None
+        return None
 
     monkeypatch.setattr(runner_module.vision, "find_image", find_image)
     monkeypatch.setattr(
         runner_module.vision, "click_match",
-        lambda _mouse, _hwnd, match: clicked.append(match),
-    )
-    monkeypatch.setattr(
-        runner, "_save_debug_screenshot_unconditional",
-        lambda _hwnd, name: saved.append(name),
+        lambda _mouse, _hwnd, match: clicked_matches.append(match),
     )
 
-    assert runner._apply_team_loadout_panel(123, stop, team_match, 1, "include") is False
-    assert clicked.count(include_match) == 3
-    assert saved == ["team_loadout_include_failed"]
+    assert runner._apply_team_loadout_panel(123, stop, team_match, 1, "include") is True
+    assert runner._mouse.click.call_args_list[:2] == [
+        ((270, 241), {}), ((270, 241), {}),
+    ]
+    assert clicked_matches.count(use_match) == 1
+    assert _close_click_count(clicked_matches) == 1
 
 
 @pytest.mark.parametrize(
-    ("team_num", "scroll_steps", "expected_y"),
-    [(4, 4, 335), (5, 5, 372), (6, 6, 409), (7, 7, 446), (8, 7, 579)],
+    ("team_num", "equipment", "initially_checked", "expected_clicks"),
+    [
+        (1, "include", True, [(270, 241), (884, 584)]),
+        (8, "exclude", True, [(270, 507), (600, 584), (884, 584)]),
+        (4, "include", False, [(270, 355), (600, 584), (884, 584)]),
+    ],
 )
-def test_scrolled_loadouts_use_wheel_over_scrollbar_and_click_visible_button_center(
-        monkeypatch, team_num, scroll_steps, expected_y):
+def test_selects_team_toggles_saved_equipment_and_uses_team(
+        monkeypatch, team_num, equipment, initially_checked, expected_clicks):
     runner = _runner()
     stop = threading.Event()
     team_match = {"cx": 100, "cy": 100, "score": 0.95}
-    open_match = {"cx": 275, "cy": 185, "score": 0.91}
-    confirm_match = {"cx": 483, "cy": 416, "score": 0.98}
-    include_match = {"cx": 456, "cy": 436, "score": 0.99}
-
-    def wait_for_image(_hwnd, name, **_kwargs):
-        return {
-            "team_loadout_open": open_match,
-            "confirm": confirm_match,
-            "include": include_match,
-        }[name]
+    opened_match = {"cx": 275, "cy": 185, "score": 0.91}
+    close_match = {"name": "nav_closeui"}
+    clicked_matches = []
+    frames = iter([
+        _team_row_frame(True, y=241 + (team_num - 1) * 38),
+        _checkbox_frame(initially_checked),
+        _checkbox_frame(equipment == "include"),
+    ])
 
     monkeypatch.setattr(runner_module.time, "sleep", lambda _seconds: None)
-    monkeypatch.setattr(runner_module.wm, "get_client_rect_screen", lambda _hwnd: (0, 0, 1152, 756))
-    monkeypatch.setattr(runner_module.vision, "wait_for_image", wait_for_image)
-    monkeypatch.setattr(runner_module.vision, "click_match", lambda *_args: None)
+    monkeypatch.setattr(runner_module.vision, "ref_to_screen", lambda _hwnd, x, y: (x, y))
+    monkeypatch.setattr(runner_module.vision, "capture_game_bgr", lambda _hwnd: next(frames))
+    monkeypatch.setattr(
+        runner_module.vision, "click_match",
+        lambda _mouse, _hwnd, match: clicked_matches.append(match),
+    )
+    monkeypatch.setattr(
+        runner_module.vision,
+        "wait_for_image",
+        lambda _hwnd, name, **_kwargs: opened_match if name == "team_loadout_open" else None,
+    )
+    def find_image(_hwnd, name):
+        if name == "team_loadout_open":
+            return {"score": 0.95} if _close_click_count(clicked_matches) == 0 else None
+        if name == "nav_closeui":
+            return close_match
+        return None
+
+    monkeypatch.setattr(
+        runner_module.vision, "find_image", find_image,
+    )
 
     assert runner._apply_team_loadout_panel(
-        123, stop, team_match, team_num, "include") is True
-
-    runner._mouse.move_to.assert_called_once_with(927, 400)
-    runner._mouse.nudge.assert_called_once_with()
-    assert runner._mouse.scroll.call_args_list == [
-        call(runner_module.TEAM_LOADOUT_WHEEL_DELTA)
-    ] * scroll_steps
-    runner._mouse.drag.assert_not_called()
-    runner._mouse.click.assert_called_once_with(850, expected_y)
+        123, stop, team_match, team_num, equipment) is True
+    actual_clicks = [(c.args[0], c.args[1]) for c in runner._mouse.click.call_args_list]
+    assert clicked_matches.count(team_match) == 1
+    assert clicked_matches.count(close_match) == 1
+    assert actual_clicks == expected_clicks
 
 
-def test_finds_partly_clipped_load_team_button_nearest_expected_row():
-    frame = np.zeros((756, 1152, 3), dtype=np.uint8)
-    # Two complete buttons and the visible top of slot 8, matching the
-    # geometry from the live failure capture.
-    frame[280:327, 778:894] = (0, 220, 80)
-    frame[404:450, 778:894] = (0, 220, 80)
-    frame[528:556, 778:894] = (0, 220, 80)
-
-    assert _find_team_load_button(frame, expected_y=579) == (836, 542)
-
-
-def test_live_button_detection_is_scaled_to_undocked_window(monkeypatch):
+def test_team_loadout_failure_when_saved_equipment_state_cannot_be_read(monkeypatch):
     runner = _runner()
     stop = threading.Event()
-    team_match = {"cx": 100, "cy": 100, "score": 0.95}
-    open_match = {"cx": 275, "cy": 185, "score": 0.91}
-    confirm_match = {"cx": 483, "cy": 416, "score": 0.98}
-    include_match = {"cx": 456, "cy": 436, "score": 0.99}
-    frame = np.zeros((756, 1152, 3), dtype=np.uint8)
-    frame[528:556, 778:894] = (0, 220, 80)
-
-    def wait_for_image(_hwnd, name, **_kwargs):
-        return {
-            "team_loadout_open": open_match,
-            "confirm": confirm_match,
-            "include": include_match,
-        }[name]
-
-    monkeypatch.setattr(runner_module.time, "sleep", lambda _seconds: None)
-    monkeypatch.setattr(runner_module.wm, "get_client_rect_screen", lambda _hwnd: (26, 50, 1178, 806))
-    monkeypatch.setattr(runner_module.vision, "wait_for_image", wait_for_image)
+    screenshots = []
+    _fast_clock(monkeypatch)
+    frames = iter([_team_row_frame(True), np.zeros((756, 1152, 3), dtype=np.uint8)])
+    monkeypatch.setattr(runner_module.vision, "capture_game_bgr", lambda _hwnd: next(frames))
+    monkeypatch.setattr(
+        runner_module.vision,
+        "wait_for_image",
+        lambda _hwnd, _name, **_kwargs: {"score": 0.95},
+    )
     monkeypatch.setattr(runner_module.vision, "click_match", lambda *_args: None)
-    monkeypatch.setattr(runner_module.vision, "capture_game_bgr", lambda _hwnd: frame)
+    monkeypatch.setattr(
+        runner, "_save_debug_screenshot_unconditional",
+        lambda _hwnd, name: screenshots.append(name),
+    )
 
     assert runner._apply_team_loadout_panel(
-        123, stop, team_match, 8, "include") is True
+        123, stop, {"cx": 100, "cy": 100, "score": 0.95}, 1, "include") is False
+    assert screenshots == ["team_loadout_equipment_state_failed"]
+    assert runner._mouse.click.call_args_list[0].args == (270, 241)
 
-    # (836, 542) in 1152x756 reference space, scaled into the client area;
-    # the outer title bar/border must not be part of the click geometry.
-    runner._mouse.click.assert_called_once_with(862, 592)
+
+def test_retries_use_team_until_unit_teams_closes(monkeypatch):
+    runner = _runner()
+    stop = threading.Event()
+    use_match = {"score": 0.97}
+    close_match = {"name": "nav_closeui"}
+    clicked_matches = []
+    screenshots = []
+
+    _fast_clock(monkeypatch)
+    monkeypatch.setattr(runner_module.vision, "ref_to_screen", lambda _hwnd, x, y: (x, y))
+    monkeypatch.setattr(
+        runner_module.vision, "capture_game_bgr",
+        lambda _hwnd: _selected_team_frame(),
+    )
+    monkeypatch.setattr(
+        runner_module.vision, "wait_for_image",
+        lambda _hwnd, name, **_kwargs: {"score": 0.95} if name == "team_loadout_open" else None,
+    )
+
+    def find_image(_hwnd, name):
+        if name == "team_use":
+            return use_match
+        if name == "nav_closeui":
+            return close_match
+        if name == "team_loadout_open":
+            return {"score": 0.95} if _close_click_count(clicked_matches) < 2 else None
+        return None
+
+    monkeypatch.setattr(runner_module.vision, "find_image", find_image)
+    monkeypatch.setattr(
+        runner_module.vision, "click_match",
+        lambda _mouse, _hwnd, match: clicked_matches.append(match),
+    )
+    monkeypatch.setattr(
+        runner, "_save_debug_screenshot_unconditional",
+        lambda _hwnd, name: screenshots.append(name),
+    )
+
+    assert runner._apply_team_loadout_panel(
+        123, stop, {"cx": 100, "cy": 100, "score": 0.95}, 1, "include"
+    ) is True
+    assert clicked_matches.count(use_match) == 1
+    assert _close_click_count(clicked_matches) == 2
+    assert screenshots == []
+    assert any("retrying its close button" in entry.args[0]
+               for entry in runner._log.call_args_list)
+
+
+def test_debug_team_loadout_runs_without_prestart_or_battle(monkeypatch):
+    runner = _runner()
+    tested = []
+    monkeypatch.setattr(runner_module.wm, "is_window", lambda _hwnd: True)
+    monkeypatch.setattr(runner_module.wm, "show_window", lambda _hwnd: None)
+    monkeypatch.setattr(runner_module.wm, "activate_window", lambda _hwnd: True)
+    monkeypatch.setattr(runner_module.wm, "prevent_sleep", lambda: None)
+    monkeypatch.setattr(runner_module.wm, "allow_sleep", lambda: None)
+    monkeypatch.setattr(runner_module.vision, "close_mss", lambda: None)
+    monkeypatch.setattr(
+        runner, "_apply_team_loadout",
+        lambda _hwnd, _stop, _task, team_override=None: tested.append(team_override) or True,
+    )
+    monkeypatch.setattr(runner, "_run_prestart_blocks", MagicMock())
+    monkeypatch.setattr(runner, "_load_battle_blocks", MagicMock())
+
+    runner._run_debug_test(lambda: 123, "team_loadout", "", 6, threading.Event())
+
+    assert tested == [6]
+    runner._run_prestart_blocks.assert_not_called()
+    runner._load_battle_blocks.assert_not_called()
+
+
+def test_debug_team_loadout_can_start_without_macro_operation(monkeypatch):
+    runner = _runner()
+    started = []
+
+    class _Thread:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start(self):
+            started.append(self.kwargs)
+
+    monkeypatch.setattr(runner_module.threading, "Thread", _Thread)
+
+    result = runner.start_debug_test(
+        lambda: None, "team_loadout", "", coords={}, team_num=6)
+
+    assert result == {"ok": True}
+    assert started[0]["args"][1:4] == ("team_loadout", "", 6)
+
+
+@pytest.mark.parametrize("team_num", [None, 0, 9, "bad"])
+def test_debug_team_loadout_rejects_invalid_team(team_num):
+    result = _runner().start_debug_test(
+        lambda: None, "team_loadout", "Farm", coords={}, team_num=team_num)
+    assert result == {"ok": False, "reason": "bad_team"}

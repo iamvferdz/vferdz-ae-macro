@@ -50,3 +50,22 @@ def test_boss_rush_card_coordinates_can_be_saved_and_read_back(monkeypatch):
     changes["boss_rush_card_right_x"] = 920
     assert {key: api.get_macro_coords()[key] for key in changes} == changes
     assert all(key in main.MACRO_COORD_DEFAULTS for key in changes)
+
+
+def test_old_default_team_loadout_coordinates_migrate_without_overwriting_custom_points(monkeypatch):
+    state = {
+        "team_loadout_x": 800,
+        "team_loadout_y": 324,
+        "team_loadout_row_height": 126,
+    }
+    monkeypatch.setattr(main.cfg, "load", lambda: dict(state))
+    api = object.__new__(main.Api)
+
+    coords = api.get_macro_coords()
+    assert (coords["team_loadout_x"], coords["team_loadout_y"],
+            coords["team_loadout_row_height"]) == (270, 241, 38)
+
+    state["team_loadout_x"] = 805
+    coords = api.get_macro_coords()
+    assert (coords["team_loadout_x"], coords["team_loadout_y"],
+            coords["team_loadout_row_height"]) == (805, 241, 38)

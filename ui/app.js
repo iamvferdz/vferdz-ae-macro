@@ -1121,8 +1121,6 @@ async function loadSettingsUI() {
     if (actionDelayEl) actionDelayEl.value = s.action_delay_ms || 0;
     const debugScreenshotsEl = document.getElementById('toggle-debug-screenshots');
     if (debugScreenshotsEl) debugScreenshotsEl.classList.toggle('on', !!s.debug_screenshots);
-    const looseTeamOcrEl = document.getElementById('toggle-loose-team-ocr-match');
-    if (looseTeamOcrEl) looseTeamOcrEl.classList.toggle('on', !!s.loose_team_ocr_match);
     const expColorEl = document.getElementById('toggle-expedition-color');
     // Default ON -- the key is simply absent until the user first flips it.
     if (expColorEl) expColorEl.classList.toggle('on', s.expedition_color_buttons !== false);
@@ -1223,14 +1221,22 @@ async function loadSettingsUI() {
 // every Macro Operation dropdown elsewhere already pulls from.
 async function refreshDebugMacroOpSelect() {
   const sel = document.getElementById('debug-macro-op-select');
-  if (!sel) return;
   let names = [];
   try { names = await pywebview.api.list_templates(); } catch (e) { names = []; }
-  const prev = sel.value;
-  sel.innerHTML = names.length
-    ? names.map(n => `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`).join('')
-    : '<option value="">No Macro Operations saved yet</option>';
-  if (names.includes(prev)) sel.value = prev;
+  if (sel) {
+    const prev = sel.value;
+    sel.innerHTML = names.length
+      ? names.map(n => `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`).join('')
+      : '<option value="">No Macro Operations saved yet</option>';
+    if (names.includes(prev)) sel.value = prev;
+  }
+  const teamSel = document.getElementById('debug-team-loadout-select');
+  if (teamSel) {
+    const previousTeam = teamSel.value || '1';
+    teamSel.innerHTML = Array.from({ length: 8 }, (_, i) =>
+      `<option value="${i + 1}">Team ${i + 1}</option>`).join('');
+    teamSel.value = previousTeam;
+  }
 }
 
 // Settings > Debug > "Select Roblox Window": lists every standalone Roblox
@@ -1513,7 +1519,7 @@ async function forceRejoin(btn) {
   setTimeout(() => { btn.textContent = original; btn.disabled = false; }, 1600);
 }
 
-// Settings > Debug > "Test Pre Start"/"Test Battle" -- starts a chosen
+// Settings > Debug > Macro Operation Test -- starts a chosen
 // Macro Operation's blocks running against Roblox as it is right now, as a
 // REAL tracked run (not a quick one-shot like testExpeditionWave/
 // forceRejoin above) -- Battle mode in particular ticks indefinitely until
@@ -1524,19 +1530,22 @@ async function forceRejoin(btn) {
 async function testMacroOperation(btn, mode) {
   const sel = document.getElementById('debug-macro-op-select');
   const macroName = sel ? sel.value : '';
-  if (!macroName) {
+  if (mode !== 'team_loadout' && !macroName) {
     addLog('[Debug] No Macro Operation selected to test.');
     return;
   }
+  const teamSel = document.getElementById('debug-team-loadout-select');
+  const teamNum = mode === 'team_loadout' && teamSel ? parseInt(teamSel.value, 10) : null;
   switchScreen('dashboard');
   const original = btn.textContent;
   btn.disabled = true;
   btn.textContent = 'Starting...';
   try {
-    const result = await pywebview.api.debug_test_macro_operation(mode, macroName);
+    const result = await pywebview.api.debug_test_macro_operation(mode, macroName, teamNum);
     if (!result.ok) {
       const reasons = { no_roblox: 'Roblox not found.', already_running: 'already running.',
-                         bad_mode: 'bad mode.', no_macro: 'no Macro Operation selected.' };
+                         bad_mode: 'bad mode.', bad_team: 'invalid team selected.',
+                         no_macro: 'no Macro Operation selected.' };
       addLog(`[Debug] Couldn't start test: ${reasons[result.reason] || result.reason || 'error'}`);
     }
     setMacroButtons(!!result.ok, false);
@@ -4716,6 +4725,7 @@ const MACRO_COORD_KEYS = [
   'challenge_stage_3_x', 'challenge_stage_3_y',
   'expedition_difficulty_x', 'expedition_difficulty_y',
   'team_loadout_x', 'team_loadout_y', 'team_loadout_row_height',
+  'team_equipment_x', 'team_equipment_y', 'team_use_x', 'team_use_y',
   'team_button_x', 'team_button_y',
   'screen_middle_x', 'screen_middle_y',
   'portal_card_x', 'portal_card_y',
@@ -4806,7 +4816,7 @@ async function openCoordPicker(prefix) {
   grid.style.display = '';
   grid.innerHTML = '<div class="rh-empty">Capturing the Roblox screen...</div>';
   document.getElementById('pu-pos-readout').textContent = puState.coordHeightKey
-    ? 'Click the FIRST row (e.g. Level 1 / Act 1 / Loadout 1)'
+    ? (prefix === 'team_loadout' ? 'Click Team 1, then Team 2 to set row spacing' : 'Click the FIRST row (e.g. Level 1 / Act 1)')
     : (puState.markX != null ? `X ${puState.markX}, Y ${puState.markY}` : 'Not set');
   document.getElementById('pu-modal').style.display = 'flex';
 
@@ -6083,7 +6093,9 @@ function applyPlaceUnitPosition() {
         // Bulk atomic save -- x and y in one write, no race (see set_macro_coords).
         saveMacroCoords({ [`${p}_x`]: puState.markX, [`${p}_y`]: puState.markY });
         puState.coordStep = 1;
-        readout.textContent = `Row 1 set (X ${puState.markX}, Y ${puState.markY}). Now click the SECOND row down.`;
+        readout.textContent = p === 'team_loadout'
+          ? `Team 1 set (X ${puState.markX}, Y ${puState.markY}). Now click Team 2.`
+          : `Row 1 set (X ${puState.markX}, Y ${puState.markY}). Now click the SECOND row down.`;
         return;
       }
       // Step 1: height = vertical gap; base stays row 1 (already saved).
@@ -6093,7 +6105,8 @@ function applyPlaceUnitPosition() {
       saveMacroCoords({ [puState.coordHeightKey]: h });
       // Preview every derived row so the math is visible before you trust it.
       const rows = [];
-      for (let i = 0; i < 7; i++) rows.push({ x: puState.coordFirst.x, y: puState.coordFirst.y + i * h, label: `${i + 1}` });
+      const rowCount = p === 'team_loadout' ? 8 : 7;
+      for (let i = 0; i < rowCount; i++) rows.push({ x: puState.coordFirst.x, y: puState.coordFirst.y + i * h, label: `${i + 1}` });
       puState.coordPreview = rows;
       puState.coordStep = 0;  // click again to redo from row 1
       readout.textContent = `Rows set: base (X ${puState.coordFirst.x}, Y ${puState.coordFirst.y}), row height ${h}px. Click row 1 again to redo.`;
