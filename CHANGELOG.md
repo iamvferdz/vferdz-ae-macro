@@ -2,6 +2,11 @@
 
 All notable changes to Anime Expeditions (VFERDZ-AE-MACRO) are documented here.
 
+## [0.24.5] - 2026-10-16
+
+### Improved
+- **Team Loadout Process**: new update on macro team loadout due to game interface changes
+
 ## [0.24.4] - 2026-10-06
 
 ### Fixed
